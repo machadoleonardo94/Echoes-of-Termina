@@ -4,7 +4,7 @@ Single-row audio transport bar:
 """
 from __future__ import annotations
 
-from PySide6.QtCore    import Qt, Signal
+from PySide6.QtCore    import Qt, QTimer, Signal
 from PySide6.QtWidgets import (QHBoxLayout, QLabel, QLineEdit, QPushButton,
                                 QSlider, QSpinBox, QWidget)
 
@@ -58,6 +58,12 @@ class TransportBar(QWidget):
         self._player   = player
         self._seeking  = False
         self._beat_ms  = 500          # default 120 BPM → 500 ms/beat
+
+        # Single-shot timer: pauses after a one-beat preview
+        self._beat_preview = QTimer(self)
+        self._beat_preview.setSingleShot(True)
+        self._beat_preview.timeout.connect(self._player.pause)
+
         self._build()
         self._wire()
 
@@ -236,9 +242,15 @@ class TransportBar(QWidget):
         self.seek_requested.emit(pos)
 
     def _step_next(self) -> None:
+        was_paused = not self._player.is_playing
         dur = self._player.duration
         pos = self._player.position + self._beat_ms
         if dur > 0:
             pos = min(pos, dur)
         self._player.seek(pos)
         self.seek_requested.emit(pos)
+        if was_paused:
+            # Play audio for one beat, then pause again
+            self._beat_preview.stop()
+            self._player.play()
+            self._beat_preview.start(self._beat_ms)

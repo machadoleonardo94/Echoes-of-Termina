@@ -191,6 +191,50 @@ class ScriptEditor(QPlainTextEdit):
             self._error_lines = lines
             self._refresh_extras()
 
+    def insert_command_line(self, line: str) -> None:
+        """
+        Insert *line* into the document in ascending timestamp order.
+
+        Scans existing blocks for their leading M:SS timestamp; inserts
+        before the first block whose timestamp is strictly greater than
+        the new line's timestamp, or appends at the end.
+        """
+        from core.script_engine import _parse_timestamp
+
+        tokens = line.split()
+        new_ms = _parse_timestamp(tokens[0]) if tokens else None
+
+        doc = self.document()
+        n   = doc.blockCount()
+
+        insert_before = n   # default: append
+        if new_ms is not None:
+            for i in range(n):
+                blk = doc.findBlockByNumber(i)
+                txt = blk.text().strip()
+                if not txt or txt.startswith('#'):
+                    continue
+                toks = txt.split()
+                ts = _parse_timestamp(toks[0]) if toks else None
+                if ts is not None and ts > new_ms:
+                    insert_before = i
+                    break
+
+        cursor = QTextCursor(doc)
+        if insert_before < n:
+            blk = doc.findBlockByNumber(insert_before)
+            cursor.setPosition(blk.position())
+            cursor.insertText(line + '\n')
+        else:
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            last_text = doc.findBlockByNumber(n - 1).text()
+            if last_text.strip():
+                cursor.insertText('\n')
+            cursor.insertText(line)
+
+        self.setTextCursor(cursor)
+        self.ensureCursorVisible()
+
     # ── Extra selections ─────────────────────────────────────────────────────
 
     def _refresh_extras(self) -> None:

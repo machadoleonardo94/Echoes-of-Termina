@@ -36,9 +36,10 @@ _PROJECTS = os.path.normpath(
     os.path.join(os.path.dirname(__file__), '..', 'projects'))
 if not os.path.isdir(_PROJECTS):
     os.makedirs(_PROJECTS, exist_ok=True)
-from ui.led_canvas    import LEDCanvas
-from ui.script_editor import ScriptEditor
-from ui.transport_bar import TransportBar
+from ui.command_toolbox import CommandToolbox
+from ui.led_canvas      import LEDCanvas
+from ui.script_editor   import ScriptEditor
+from ui.transport_bar   import TransportBar
 
 
 class MainWindow(QMainWindow):
@@ -102,6 +103,14 @@ class MainWindow(QMainWindow):
 
         self._canvas = LEDCanvas()
         rv.addWidget(self._canvas, stretch=1)
+
+        div_cmd = QWidget()
+        div_cmd.setFixedHeight(1)
+        div_cmd.setStyleSheet("background:#333333;")
+        rv.addWidget(div_cmd)
+
+        self._toolbox = CommandToolbox(self._audio)
+        rv.addWidget(self._toolbox, stretch=0)
 
         div = QWidget()
         div.setFixedHeight(1)
@@ -238,6 +247,7 @@ class MainWindow(QMainWindow):
         self._editor.script_changed.connect(self._on_script_changed)
         self._transport.seek_requested.connect(self._on_seek)
         self._canvas.zone_right_clicked.connect(self._on_zone_right_clicked)
+        self._toolbox.command_ready.connect(self._editor.insert_command_line)
 
     # ── File operations ───────────────────────────────────────────────────────
 

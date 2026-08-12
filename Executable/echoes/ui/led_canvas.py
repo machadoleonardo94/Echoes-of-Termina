@@ -174,7 +174,7 @@ class LEDCanvas(QWidget):
         _CIRCLE_TOL = 1.0   # DXF units: bbox width vs height must be this close
         _MIN_R_PX   = 5     # minimum rendered radius in screen pixels
 
-        circle_pen = QPen(QColor(170, 200, 255, 200), 1.5)
+        circle_pen = QPen(QColor(100, 130, 160,  70), 0.8)
         circle_pen.setCosmetic(True)
         spike_pen  = QPen(QColor(100, 130, 160,  70), 0.8)
         spike_pen.setCosmetic(True)
