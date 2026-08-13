@@ -18,7 +18,9 @@ The MainWindow owns the AudioPlayer and ScriptEngine and wires them together:
 """
 from __future__ import annotations
 
+import datetime
 import os
+import re
 from typing import Optional
 
 from PySide6.QtCore    import Qt, QSize
@@ -36,23 +38,82 @@ _PROJECTS = os.path.normpath(
     os.path.join(os.path.dirname(__file__), '..', 'projects'))
 if not os.path.isdir(_PROJECTS):
     os.makedirs(_PROJECTS, exist_ok=True)
-from ui.command_toolbox import CommandToolbox
-from ui.led_canvas      import LEDCanvas
-from ui.script_editor   import ScriptEditor
-from ui.transport_bar   import TransportBar
+
+# ── Chart-import audio-search helpers ────────────────────────────────────────
+
+# Stream metadata keys to probe in order of preference
+_AUDIO_STREAM_KEYS = [
+    'MusicStream', 'GuitarStream', 'RhythmStream', 'BassStream',
+    'KeysStream', 'DrumStream', 'VocalStream',
+]
+# Reserved stem names used by Clone Hero when explicit tags are absent
+_AUDIO_STEMS = ['song', 'guitar', 'bass', 'rhythm', 'keys', 'drums', 'vocals', 'crowd']
+_AUDIO_EXTS  = ['.ogg', '.opus', '.mp3', '.wav', '.flac']
+
+
+def _find_chart_audio(chart_dir: str, song_meta: dict) -> Optional[str]:
+    """
+    Return the first existing audio filename in *chart_dir*.
+    Search order:
+      1. Explicit stream metadata tags (MusicStream, GuitarStream, …)
+      2. Reserved Clone Hero stem names (song.ogg, guitar.ogg, …)
+    Returns the bare filename, or None if nothing found.
+    """
+    # 1 – metadata tags
+    for key in _AUDIO_STREAM_KEYS:
+        fname = song_meta.get(key, '').strip().strip('"')
+        if fname and os.path.isfile(os.path.join(chart_dir, fname)):
+            return fname
+    # 2 – reserved filenames
+    for stem in _AUDIO_STEMS:
+        for ext in _AUDIO_EXTS:
+            fname = stem + ext
+            if os.path.isfile(os.path.join(chart_dir, fname)):
+                return fname
+    return None
+
+
+def _parse_song_ini(path: str) -> dict:
+    """
+    Parse a song.ini file and return a flat {key: value} dict.
+    Strips leading/trailing quotes and whitespace from values.
+    Per spec, song.ini metadata should take priority over [Song] block data.
+    """
+    meta: dict = {}
+    try:
+        with open(path, encoding='utf-8-sig', errors='replace') as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith('[') or line.startswith(';') or line.startswith('#'):
+                    continue
+                if '=' in line:
+                    key, _, val = line.partition('=')
+                    meta[key.strip()] = val.strip().strip('"')
+    except OSError:
+        pass
+    return meta
+
+
+from ui.command_toolbox  import CommandToolbox
+from ui.led_canvas       import LEDCanvas
+from ui.metadata_dialog  import MetadataDialog
+from ui.note_highway     import NoteHighway
+from ui.script_editor    import ScriptEditor
+from ui.transport_bar    import TransportBar
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Echoes")
-        self.resize(1280, 720)
+        self.resize(1440, 780)
 
         self._audio  = AudioPlayer(self)
         self._engine = ScriptEngine()
         self._script_path: Optional[str] = None
         self._last_audio_dir:  str = _PROJECTS
         self._last_script_dir: str = _PROJECTS
+        self._meta: dict = {}   # metadata parsed from / written to the .echoes header
 
         self._build_central()
         self._build_toolbar()
@@ -75,7 +136,7 @@ class MainWindow(QMainWindow):
         # Left — script editor
         self._editor = ScriptEditor()
         self._editor.setPlaceholderText(
-            "# Echoes light show script\n"
+            "# Echoes lightshow script\n"
             "#\n"
             "# SET   M:SS  SET   R  G  B  LED-SPEC\n"
             "# RAMP  M:SS  RAMP  DURATION  R0 G0 B0  R1 G1 B1  LED-SPEC\n"
@@ -95,14 +156,24 @@ class MainWindow(QMainWindow):
         )
         splitter.addWidget(self._editor)
 
-        # Right — canvas + transport
+        # Right — [highway | canvas] + toolbox + transport
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(0)
 
+        # Horizontal splitter: note highway on the left, LED canvas on the right
+        hsplit = QSplitter(Qt.Orientation.Horizontal)
+        hsplit.setHandleWidth(2)
+
+        self._highway = NoteHighway()
+        hsplit.addWidget(self._highway)
+
         self._canvas = LEDCanvas()
-        rv.addWidget(self._canvas, stretch=1)
+        hsplit.addWidget(self._canvas)
+
+        hsplit.setSizes([340, 540])
+        rv.addWidget(hsplit, stretch=1)
 
         div_cmd = QWidget()
         div_cmd.setFixedHeight(1)
@@ -121,7 +192,7 @@ class MainWindow(QMainWindow):
         rv.addWidget(self._transport, stretch=0)
 
         splitter.addWidget(right)
-        splitter.setSizes([400, 880])
+        splitter.setSizes([400, 1000])
         vbox.addWidget(splitter, stretch=1)
 
         self.statusBar().showMessage(
@@ -224,14 +295,16 @@ class MainWindow(QMainWindow):
     def _build_menu(self) -> None:
         mb = self.menuBar()
         fm = mb.addMenu("&File")
-        self._act(fm, "&Open Audio…",      "Ctrl+O",        self._open_mp3)
+        self._act(fm, "&Open Audio\u2026",         "Ctrl+O",        self._open_mp3)
         fm.addSeparator()
-        self._act(fm, "Open &Script…",    "Ctrl+Shift+O",  self._open_script)
-        self._act(fm, "&Save Script",      "Ctrl+S",        self._save_script)
-        self._act(fm, "Save Script &As\u2026", "Ctrl+Shift+S",  self._save_script_as)
-        self._act(fm, "Import &.chart\u2026",  "",              self._import_chart)
+        self._act(fm, "Open &Script\u2026",       "Ctrl+Shift+O",  self._open_script)
+        self._act(fm, "&Save Script",             "Ctrl+S",        self._save_script)
+        self._act(fm, "Save Script &As\u2026",    "Ctrl+Shift+S",  self._save_script_as)
+        self._act(fm, "Import &.chart\u2026",     "",              self._import_chart)
         fm.addSeparator()
-        self._act(fm, "&Quit",             "Ctrl+Q",        self.close)
+        self._act(fm, "Script &Properties\u2026", "Ctrl+I",        self._show_properties)
+        fm.addSeparator()
+        self._act(fm, "&Quit",                    "Ctrl+Q",        self.close)
 
     def _act(self, menu, label: str, shortcut: str, slot) -> None:
         a = QAction(label, self)
@@ -243,11 +316,16 @@ class MainWindow(QMainWindow):
 
     def _wire(self) -> None:
         self._audio.position_changed.connect(self._on_position)
+        self._audio.duration_changed.connect(self._on_duration)
         self._audio.error_occurred.connect(self._on_audio_error)
         self._editor.script_changed.connect(self._on_script_changed)
         self._transport.seek_requested.connect(self._on_seek)
         self._canvas.zone_right_clicked.connect(self._on_zone_right_clicked)
         self._toolbox.command_ready.connect(self._editor.insert_command_line)
+        # Keep note highway in sync with BPM changes
+        self._transport._bpm.valueChanged.connect(
+            lambda bpm: self._highway.set_beat_ms(round(60_000 / bpm)))
+        self._highway.set_beat_ms(round(60_000 / self._transport._bpm.value()))
 
     # ── File operations ───────────────────────────────────────────────────────
 
@@ -271,6 +349,49 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
+        try:
+            # utf-8-sig strips an optional UTF-8 BOM — common in .chart files.
+            # Without it the very first line (\ufeff[Song]) doesn't match the
+            # section-header regex and the [Song] block ends up empty.
+            with open(path, encoding="utf-8-sig", errors="replace") as fh:
+                chart_text = fh.read()
+        except OSError as exc:
+            QMessageBox.critical(self, "Cannot open file", str(exc))
+            return
+
+        from core.chart_importer import get_chart_info, convert_tracks
+        from ui.chart_import_dialog import ChartImportDialog
+
+        song_meta, tracks, initial_bpm, ts_num, ts_den = get_chart_info(chart_text)
+
+        # song.ini (same folder) takes metadata priority over [Song] per spec
+        chart_dir    = os.path.dirname(path)
+        ini_path     = os.path.join(chart_dir, 'song.ini')
+        if os.path.isfile(ini_path):
+            ini_meta = _parse_song_ini(ini_path)
+            # Merge: song.ini wins for keys that exist in both
+            song_meta = {**song_meta, **ini_meta}
+
+        # Append derived timing info for display in the dialog
+        bpm_display = (f'{initial_bpm:.3f}' if initial_bpm != round(initial_bpm)
+                       else str(round(initial_bpm)))
+        song_meta['_Tempo']     = f'{bpm_display} BPM'
+        song_meta['_TimeSig']   = f'{ts_num}/{ts_den}'
+        song_meta['_Resolution'] = song_meta.get('Resolution', '192') + ' ticks/quarter-note'
+
+        dlg = ChartImportDialog(song_meta, tracks, self)
+        if dlg.exec() != ChartImportDialog.DialogCode.Accepted:
+            return
+
+        configs = dlg.get_configs()
+
+        if not any(c.enabled for c in configs):
+            QMessageBox.information(
+                self, "Nothing to import",
+                "No tracks were selected.  Enable at least one track to import.",
+            )
+            return
+
         if self._editor.toPlainText().strip():
             ans = QMessageBox.question(
                 self, "Replace script?",
@@ -281,30 +402,58 @@ class MainWindow(QMainWindow):
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
-        try:
-            with open(path, encoding="utf-8", errors="replace") as fh:
-                chart_text = fh.read()
-        except OSError as exc:
-            QMessageBox.critical(self, "Cannot open file", str(exc))
-            return
-
-        from core.chart_importer import convert
-        script, audio_file = convert(chart_text)
-
+        script, _audio_hint = convert_tracks(chart_text, configs)
         self._editor.setPlainText(script)
-        self.statusBar().showMessage(f"Imported: {os.path.basename(path)}")
 
-        # Auto-load the referenced audio file if it lives next to the .chart
+        # ── Populate script metadata from chart info ──────────────────────────
+        def _mv(*keys: str) -> str:
+            """First non-empty value from song_meta for any of the given keys."""
+            for k in keys:
+                v = song_meta.get(k, '').strip().strip('"').strip()
+                if v:
+                    return v
+            return ''
+
+        self._meta = {}
+        self._meta['title']   = _mv('Name',    'name')
+        self._meta['author']  = _mv('Artist',  'artist')
+        self._meta['charter'] = _mv('Charter', 'charter')
+        self._meta['album']   = _mv('Album',   'album')
+        # Strip GHTCP leading ", " from Year (e.g. ", 1998" → "1998")
+        self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
+        self._meta['bpm']     = str(bpm_int)
+        self._meta['timesig'] = f'{ts_num}/{ts_den}'
+        # Track labels: names of the enabled chart sections in import order
+        enabled_cfgs = [c for c in configs if c.enabled]
+        for i, cfg in enumerate(enabled_cfgs[:4]):
+            self._meta[f'track{i + 1}'] = cfg.track_name
+
+        # Duration: set now if the player already knows it; otherwise
+        # _on_duration will fill it in as soon as audio metadata loads.
+        if self._audio.duration > 0:
+            self._meta['duration'] = format_ms(self._audio.duration)
+
+        # ── Sync transport BPM and time signature ────────────────────────────
+        bpm_int = max(20, min(300, round(initial_bpm)))
+        self._transport._bpm.setValue(bpm_int)
+        self._transport.set_timesig(ts_num, ts_den)
+
+        # ── Find and load audio ───────────────────────────────────────────────
+        audio_file = _find_chart_audio(chart_dir, song_meta)
         if audio_file:
-            chart_dir = os.path.dirname(path)
             audio_path = os.path.join(chart_dir, audio_file)
-            if os.path.isfile(audio_path):
-                self._audio.load(audio_path)
-                self._info_bar.setText(f"  \u266b  {audio_file}")
-                self.statusBar().showMessage(
-                    f"Imported: {os.path.basename(path)}  \u2014  "
-                    f"audio: {audio_file}"
-                )
+            self._audio.load(audio_path)
+            self._info_bar.setText(f"  \u266b  {audio_file}")
+            self.statusBar().showMessage(
+                f"Imported: {os.path.basename(path)}  \u2014  "
+                f"audio: {audio_file}  \u2014  "
+                f"{bpm_int} BPM  {ts_num}/{ts_den}"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Imported: {os.path.basename(path)}  \u2014  "
+                f"{bpm_int} BPM  {ts_num}/{ts_den}"
+            )
 
     def _open_script(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -315,10 +464,13 @@ class MainWindow(QMainWindow):
             return
         try:
             with open(path, encoding="utf-8") as fh:
-                self._editor.setPlainText(fh.read())
+                text = fh.read()
         except OSError as exc:
             QMessageBox.critical(self, "Cannot open file", str(exc))
             return
+        self._meta = self._parse_meta(text)
+        self._sync_meta_to_transport()
+        self._editor.setPlainText(text)
         self._script_path = path
         self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
 
@@ -342,9 +494,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
 
     def _write_script(self, path: str) -> None:
+        # Refresh auto-fields before writing
+        self._meta['bpm'] = str(self._transport._bpm.value())
+        ts_num = self._transport._ts_num.value()
+        ts_den = int(self._transport._ts_den.currentText())
+        self._meta['timesig']  = f"{ts_num}/{ts_den}"
+        self._meta['modified'] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        dur_ms = self._audio.duration
+        if dur_ms:
+            self._meta['duration'] = format_ms(dur_ms)
+        body = self._strip_meta(self._editor.toPlainText())
         try:
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(self._editor.toPlainText())
+                fh.write(self._build_meta_header(self._meta))
+                fh.write(body)
             self.statusBar().showMessage(f"Saved: {path}")
         except OSError as exc:
             QMessageBox.critical(self, "Cannot save file", str(exc))
@@ -353,14 +516,21 @@ class MainWindow(QMainWindow):
 
     def _on_position(self, pos_ms: int) -> None:
         self._editor.set_active_line(self._engine.get_active_line_at(pos_ms))
-        self._canvas.update_leds(self._engine.evaluate_at(pos_ms))
+        states = self._engine.evaluate_at(pos_ms)
+        self._canvas.update_leds(states)
+        self._highway.update_position(pos_ms)
+        self._highway.update_leds(states)
 
     def _on_seek(self, pos_ms: int) -> None:
         self._editor.set_active_line(self._engine.get_active_line_at(pos_ms))
-        self._canvas.update_leds(self._engine.evaluate_at(pos_ms))
+        states = self._engine.evaluate_at(pos_ms)
+        self._canvas.update_leds(states)
+        self._highway.update_position(pos_ms)
+        self._highway.update_leds(states)
 
     def _on_script_changed(self, text: str) -> None:
         self._engine.parse(text)
+        self._highway.update_commands(self._engine.commands)
         self._editor.set_error_lines(self._engine.error_line_set())
         n = len(self._engine.errors)
         if n:
@@ -374,8 +544,93 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(
                 f"Script OK \u2014 {c} command{'s' if c != 1 else ''}")
 
+    def _on_duration(self, ms: int) -> None:
+        """Keep _meta duration in sync whenever audio is (re)loaded."""
+        if ms > 0:
+            self._meta['duration'] = format_ms(ms)
+
     def _on_audio_error(self, msg: str) -> None:
         self.statusBar().showMessage(f"Audio error: {msg}")
+
+    # ── Properties dialog ────────────────────────────────────────────────
+
+    def _show_properties(self) -> None:
+        dlg = MetadataDialog(self._meta, self)
+        if dlg.exec() != MetadataDialog.DialogCode.Accepted:
+            return
+        self._meta = dlg.get_meta()
+        self._sync_meta_to_transport()
+
+    # ── Metadata helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_meta(text: str) -> dict:
+        """Extract leading # @key value lines from a script."""
+        meta: dict = {}
+        for line in text.splitlines():
+            s = line.strip()
+            if not s.startswith('#'):
+                break
+            m = re.match(r'^#\s*@(\w+)\s*(.*)', s)
+            if m:
+                key, val = m.group(1), m.group(2).strip()
+                if key == 'comment':
+                    prev = meta.get('comment', '')
+                    meta['comment'] = (prev + '\n' + val).lstrip('\n') if prev else val
+                else:
+                    meta[key] = val
+        return meta
+
+    @staticmethod
+    def _strip_meta(text: str) -> str:
+        """Remove the leading # @... metadata block, leaving the script body."""
+        lines = text.splitlines(keepends=True)
+        i = 0
+        while i < len(lines):
+            s = lines[i].strip()
+            if re.match(r'^#\s*@\w+', s) or s == '#':
+                i += 1
+            else:
+                break
+        return ''.join(lines[i:])
+
+    @staticmethod
+    def _build_meta_header(meta: dict) -> str:
+        """Serialise metadata dict to a # @key  value header block."""
+        lines = []
+        for key in ('title', 'author', 'charter', 'album', 'year',
+                    'bpm', 'timesig',
+                    'track1', 'track2', 'track3', 'track4',
+                    'duration', 'modified'):
+            val = meta.get(key, '').strip()
+            if val:
+                lines.append(f'# @{key:<10} {val}')
+        comment = meta.get('comment', '').strip()
+        if comment:
+            for cl in comment.splitlines():
+                lines.append(f'# @comment    {cl}')
+        if lines:
+            lines.append('#')
+            return '\n'.join(lines) + '\n'
+        return ''
+
+    def _sync_meta_to_transport(self) -> None:
+        """Push BPM and time-signature from _meta into the transport bar."""
+        try:
+            bpm = int(self._meta.get('bpm', '') or 0)
+            if bpm:
+                self._transport._bpm.setValue(bpm)
+        except ValueError:
+            pass
+        try:
+            ts = self._meta.get('timesig', '')
+            if '/' in ts:
+                num, den = ts.split('/', 1)
+                self._transport.set_timesig(int(num), int(den))
+            elif ts:
+                self._transport.set_timesig(int(ts), 4)
+        except (ValueError, IndexError):
+            pass
 
     # ── Hardware version conversion ────────────────────────────────────────────
 
