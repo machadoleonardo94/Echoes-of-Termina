@@ -239,6 +239,12 @@ class MainWindow(QMainWindow):
         act_chart.triggered.connect(self._import_chart)
         tb.addAction(act_chart)
 
+        act_mid = QAction(
+            style.standardIcon(SP.SP_FileDialogDetailedView), "  Import .mid", self)
+        act_mid.setToolTip("Import a Clone Hero / Rock Band notes.mid file as echoes script")
+        act_mid.triggered.connect(self._import_midi)
+        tb.addAction(act_mid)
+
         tb.addSeparator()
 
         act_convert = QAction(
@@ -301,6 +307,7 @@ class MainWindow(QMainWindow):
         self._act(fm, "&Save Script",             "Ctrl+S",        self._save_script)
         self._act(fm, "Save Script &As\u2026",    "Ctrl+Shift+S",  self._save_script_as)
         self._act(fm, "Import &.chart\u2026",     "",              self._import_chart)
+        self._act(fm, "Import .&mid\u2026",        "",              self._import_midi)
         fm.addSeparator()
         self._act(fm, "Script &Properties\u2026", "Ctrl+I",        self._show_properties)
         fm.addSeparator()
@@ -448,6 +455,112 @@ class MainWindow(QMainWindow):
                 f"Imported: {os.path.basename(path)}  \u2014  "
                 f"audio: {audio_file}  \u2014  "
                 f"{bpm_int} BPM  {ts_num}/{ts_den}"
+            )
+        else:
+            self.statusBar().showMessage(
+                f"Imported: {os.path.basename(path)}  \u2014  "
+                f"{bpm_int} BPM  {ts_num}/{ts_den}"
+            )
+
+    def _import_midi(self) -> None:
+        """Import a Clone Hero / Rock Band notes.mid file as an echoes script."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import MIDI Chart", self._last_audio_dir,
+            "MIDI Chart (*.mid *.midi);;All Files (*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, 'rb') as fh:
+                midi_data = fh.read()
+        except OSError as exc:
+            QMessageBox.critical(self, "Cannot open file", str(exc))
+            return
+
+        from core.midi_importer import get_midi_info, convert_midi_tracks
+        from ui.chart_import_dialog import ChartImportDialog
+
+        try:
+            song_meta, tracks, initial_bpm, ts_num, ts_den = get_midi_info(midi_data)
+        except ValueError as exc:
+            QMessageBox.critical(self, "Cannot read MIDI file", str(exc))
+            return
+
+        # song.ini in the same folder is the canonical metadata source for .mid
+        chart_dir = os.path.dirname(path)
+        ini_path  = os.path.join(chart_dir, 'song.ini')
+        if os.path.isfile(ini_path):
+            ini_meta  = _parse_song_ini(ini_path)
+            song_meta = {**song_meta, **ini_meta}
+
+        bpm_display = (f'{initial_bpm:.3f}' if initial_bpm != round(initial_bpm)
+                       else str(round(initial_bpm)))
+        song_meta['_Tempo']      = f'{bpm_display} BPM'
+        song_meta['_TimeSig']    = f'{ts_num}/{ts_den}'
+        song_meta['_Resolution'] = song_meta.get('Resolution', '480') + ' ticks/quarter-note'
+
+        dlg = ChartImportDialog(song_meta, tracks, self)
+        if dlg.exec() != ChartImportDialog.DialogCode.Accepted:
+            return
+
+        configs = dlg.get_configs()
+
+        if not any(c.enabled for c in configs):
+            QMessageBox.information(
+                self, "Nothing to import",
+                "No tracks were selected.  Enable at least one track to import.",
+            )
+            return
+
+        if self._editor.toPlainText().strip():
+            ans = QMessageBox.question(
+                self, "Replace script?",
+                "The editor already contains a script.\n"
+                "Replace it with the imported MIDI chart?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        script, _ = convert_midi_tracks(midi_data, configs)
+        self._editor.setPlainText(script)
+
+        # ── Populate metadata ─────────────────────────────────────────────────
+        def _mv(*keys: str) -> str:
+            for k in keys:
+                v = song_meta.get(k, '').strip().strip('"').strip()
+                if v:
+                    return v
+            return ''
+
+        self._meta = {}
+        self._meta['title']   = _mv('Name', 'name')
+        self._meta['author']  = _mv('Artist', 'artist')
+        self._meta['charter'] = _mv('Charter', 'charter')
+        self._meta['album']   = _mv('Album', 'album')
+        self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
+        self._meta['bpm']     = str(max(20, min(300, round(initial_bpm))))
+        self._meta['timesig'] = f'{ts_num}/{ts_den}'
+        enabled_cfgs = [c for c in configs if c.enabled]
+        for i, cfg in enumerate(enabled_cfgs[:4]):
+            self._meta[f'track{i + 1}'] = cfg.track_name
+        if self._audio.duration > 0:
+            self._meta['duration'] = format_ms(self._audio.duration)
+
+        # ── Sync transport ────────────────────────────────────────────────────
+        bpm_int = max(20, min(300, round(initial_bpm)))
+        self._transport._bpm.setValue(bpm_int)
+        self._transport.set_timesig(ts_num, ts_den)
+
+        # ── Audio ─────────────────────────────────────────────────────────────
+        audio_file = _find_chart_audio(chart_dir, song_meta)
+        if audio_file:
+            self._audio.load(os.path.join(chart_dir, audio_file))
+            self._info_bar.setText(f"  \u266b  {audio_file}")
+            self.statusBar().showMessage(
+                f"Imported: {os.path.basename(path)}  \u2014  "
+                f"audio: {audio_file}  \u2014  {bpm_int} BPM  {ts_num}/{ts_den}"
             )
         else:
             self.statusBar().showMessage(
