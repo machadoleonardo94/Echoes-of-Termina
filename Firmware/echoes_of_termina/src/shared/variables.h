@@ -17,6 +17,17 @@ uint32_t adcVoltage = 0;
 #define MAX_ADC_SAMPLES 8
 #define OVERSAMPLING_RESOLUTION 3 // 2^3 = 8 samples
 
+typedef struct buttonState
+{
+    bool currentState = LOW; // Last confirmed debounced state
+    bool lastState = LOW;    // Previous raw reading (used for debounce)
+    uint32_t lastDebounceTime = 0;
+    uint32_t debounceDelay = 50; // ms
+    uint8_t counter = 0;
+} struct_buttonState;
+
+struct_buttonState button_states;
+
 bool debugWifi = false;
 
 char macAdress[6] = {0, 0, 0, 0, 0, 0};

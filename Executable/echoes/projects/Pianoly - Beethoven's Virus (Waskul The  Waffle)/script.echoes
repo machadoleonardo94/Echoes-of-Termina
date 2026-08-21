@@ -1,18 +1,17 @@
 # @title      Beethoven's Virus
 # @author     Pianoly
-# @charter    The Waf
+# @charter    Waskul The Waffle
 # @album      Single
 # @year       2024
-# @bpm        120
+# @bpm        180
 # @timesig    4/4
 # @duration   2:54.48
-# @modified   2026-08-14 12:36
+# @modified   2026-08-14 16:12
 #
-# Beethoven's Virus
-# Pianoly
-#
+[Track 1]
 # Imported from Clone Hero .chart
 
+0:00.00 FADE 255 0 0 50 *
 0:02.662  FADE 0 0 255 98  26,17
 0:02.662  FADE 85 170 0 98  25,18
 0:02.831  FADE 0 0 255 98  26,17
@@ -1867,3 +1866,4 @@
 2:49.120  FADE 85 170 0 98  25,18
 2:49.190  FADE 0 0 255 98  26,17
 2:49.259  FADE 255 85 0 98  24,19
+

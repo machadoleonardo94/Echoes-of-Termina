@@ -98,7 +98,7 @@ from ui.command_toolbox  import CommandToolbox
 from ui.led_canvas       import LEDCanvas
 from ui.metadata_dialog  import MetadataDialog
 from ui.note_highway     import NoteHighway
-from ui.script_editor    import ScriptEditor
+from ui.script_editor    import MultiTrackEditorWidget, ScriptEditor
 from ui.transport_bar    import TransportBar
 
 
@@ -107,9 +107,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Echoes")
         self.resize(1440, 780)
+        self.setMinimumSize(900, 560)
 
         self._audio  = AudioPlayer(self)
-        self._engine = ScriptEngine()
+        self._engines: dict[str, ScriptEngine] = {}   # one engine per track slot
         self._script_path: Optional[str] = None
         self._last_audio_dir:  str = _PROJECTS
         self._last_script_dir: str = _PROJECTS
@@ -133,8 +134,8 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.setHandleWidth(2)
 
-        # Left — script editor
-        self._editor = ScriptEditor()
+        # Left — script editor (multi-track)
+        self._editor = MultiTrackEditorWidget()
         self._editor.setPlaceholderText(
             "# Echoes lightshow script\n"
             "#\n"
@@ -197,7 +198,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage(
             "Ready  —  File › Open Audio  to load a track, "
-            "File › Open Script  to load or create a show")
+            "File › Open Project  to load or create a show")
 
     def _build_toolbar(self) -> None:
         tb = QToolBar("Quick Access", self)
@@ -220,30 +221,25 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         act_import = QAction(
-            style.standardIcon(SP.SP_FileDialogStart), "  Import Script", self)
+            style.standardIcon(SP.SP_FileDialogStart), "  Open Project", self)
         act_import.setShortcut("Ctrl+Shift+O")
-        act_import.setToolTip("Open an existing .echoes script  (Ctrl+Shift+O)")
+        act_import.setToolTip("Open an existing .echoes project  (Ctrl+Shift+O)")
         act_import.triggered.connect(self._open_script)
         tb.addAction(act_import)
 
         act_export = QAction(
-            style.standardIcon(SP.SP_DialogSaveButton), "  Export Script", self)
+            style.standardIcon(SP.SP_DialogSaveButton), "  Save Script", self)
         act_export.setShortcut("Ctrl+S")
         act_export.setToolTip("Save script to file  (Ctrl+S)")
         act_export.triggered.connect(self._save_script)
         tb.addAction(act_export)
 
-        act_chart = QAction(
-            style.standardIcon(SP.SP_FileDialogDetailedView), "  Import .chart", self)
-        act_chart.setToolTip("Import a Clone Hero .chart file as echoes script")
-        act_chart.triggered.connect(self._import_chart)
-        tb.addAction(act_chart)
-
-        act_mid = QAction(
-            style.standardIcon(SP.SP_FileDialogDetailedView), "  Import .mid", self)
-        act_mid.setToolTip("Import a Clone Hero / Rock Band notes.mid file as echoes script")
-        act_mid.triggered.connect(self._import_midi)
-        tb.addAction(act_mid)
+        act_tracks = QAction(
+            style.standardIcon(SP.SP_FileDialogDetailedView), "  Import Tracks", self)
+        act_tracks.setShortcut("Ctrl+Shift+I")
+        act_tracks.setToolTip("Import tracks from a .chart or .mid file  (Ctrl+Shift+I)")
+        act_tracks.triggered.connect(self._import_tracks)
+        tb.addAction(act_tracks)
 
         tb.addSeparator()
 
@@ -303,11 +299,10 @@ class MainWindow(QMainWindow):
         fm = mb.addMenu("&File")
         self._act(fm, "&Open Audio\u2026",         "Ctrl+O",        self._open_mp3)
         fm.addSeparator()
-        self._act(fm, "Open &Script\u2026",       "Ctrl+Shift+O",  self._open_script)
+        self._act(fm, "Open &Project\u2026",      "Ctrl+Shift+O",  self._open_script)
         self._act(fm, "&Save Script",             "Ctrl+S",        self._save_script)
         self._act(fm, "Save Script &As\u2026",    "Ctrl+Shift+S",  self._save_script_as)
-        self._act(fm, "Import &.chart\u2026",     "",              self._import_chart)
-        self._act(fm, "Import .&mid\u2026",        "",              self._import_midi)
+        self._act(fm, "Import &Tracks\u2026",     "Ctrl+Shift+I",  self._import_tracks)
         fm.addSeparator()
         self._act(fm, "Script &Properties\u2026", "Ctrl+I",        self._show_properties)
         fm.addSeparator()
@@ -325,10 +320,12 @@ class MainWindow(QMainWindow):
         self._audio.position_changed.connect(self._on_position)
         self._audio.duration_changed.connect(self._on_duration)
         self._audio.error_occurred.connect(self._on_audio_error)
-        self._editor.script_changed.connect(self._on_script_changed)
+        self._editor.active_script_changed.connect(self._on_script_changed)
+        self._editor.background_script_changed.connect(self._on_background_script_changed)
         self._transport.seek_requested.connect(self._on_seek)
         self._canvas.zone_right_clicked.connect(self._on_zone_right_clicked)
-        self._toolbox.command_ready.connect(self._editor.insert_command_line)
+        self._toolbox.command_ready.connect(self._on_command_ready)
+        self._editor.tracks_changed.connect(self._toolbox.set_track_names)
         # Keep note highway in sync with BPM changes
         self._transport._bpm.valueChanged.connect(
             lambda bpm: self._highway.set_beat_ms(round(60_000 / bpm)))
@@ -347,33 +344,167 @@ class MainWindow(QMainWindow):
         self._info_bar.setText(f"  \u266b  {os.path.basename(path)}")
         self.statusBar().showMessage(f"Loaded: {path}")
 
-    def _import_chart(self) -> None:
-        """Import a Clone Hero .chart file and convert it to an echoes script."""
+    def _import_tracks(self) -> None:
+        """Unified import for .chart and .mid/.midi files."""
         path, _ = QFileDialog.getOpenFileName(
-            self, "Import Clone Hero Chart", self._last_audio_dir,
-            "Clone Hero Chart (*.chart);;All Files (*)",
+            self, "Import Tracks", self._last_audio_dir,
+            "Supported charts (*.chart *.mid *.midi)"
+            ";;Clone Hero Chart (*.chart)"
+            ";;MIDI Chart (*.mid *.midi)"
+            ";;All Files (*)",
         )
         if not path:
             return
 
+        self._last_audio_dir = os.path.dirname(path)
+        chart_dir = os.path.dirname(path)
+        ext = os.path.splitext(path)[1].lower()
+
+        # ── Parse file ───────────────────────────────────────────────────────────────
         try:
-            # utf-8-sig strips an optional UTF-8 BOM — common in .chart files.
-            # Without it the very first line (\ufeff[Song]) doesn't match the
-            # section-header regex and the [Song] block ends up empty.
-            with open(path, encoding="utf-8-sig", errors="replace") as fh:
-                chart_text = fh.read()
-        except OSError as exc:
+            if ext == '.chart':
+                with open(path, encoding='utf-8-sig', errors='replace') as fh:
+                    _file_text = fh.read()
+                from core.chart_importer import get_chart_info, convert_tracks_per_track
+                song_meta, tracks, initial_bpm, ts_num, ts_den = \
+                    get_chart_info(_file_text)
+                res_default = '192'
+                def _convert(cfgs, _t=_file_text):
+                    return convert_tracks_per_track(_t, cfgs)[0]
+            elif ext in ('.mid', '.midi'):
+                with open(path, 'rb') as fh:
+                    _file_data = fh.read()
+                from core.midi_importer import get_midi_info, convert_midi_tracks_per_track
+                song_meta, tracks, initial_bpm, ts_num, ts_den = \
+                    get_midi_info(_file_data)
+                res_default = '480'
+                def _convert(cfgs, _d=_file_data):
+                    return convert_midi_tracks_per_track(_d, cfgs)[0]
+            else:
+                QMessageBox.critical(
+                    self, "Unsupported format",
+                    f'Cannot import "{ext}" files.\nSupported: .chart  .mid  .midi'
+                )
+                return
+        except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "Cannot open file", str(exc))
             return
 
-        from core.chart_importer import get_chart_info, convert_tracks
+        # song.ini in the same folder overrides metadata if present
+        ini_path = os.path.join(chart_dir, 'song.ini')
+        if os.path.isfile(ini_path):
+            song_meta = {**song_meta, **_parse_song_ini(ini_path)}
+
+        bpm_display = (f'{initial_bpm:.3f}' if initial_bpm != round(initial_bpm)
+                       else str(round(initial_bpm)))
+        song_meta['_Tempo']      = f'{bpm_display} BPM'
+        song_meta['_TimeSig']    = f'{ts_num}/{ts_den}'
+        song_meta['_Resolution'] = (
+            song_meta.get('Resolution', res_default) + ' ticks/quarter-note')
+
+        # ── Compute slot names for the dropdown ────────────────────────────────────
+        from ui.script_editor import MAX_TRACKS
+        existing      = self._editor.get_tracks()
+        existing_names = list(existing.keys())
+        slot_names     = existing_names.copy()
+        for i in range(len(existing_names), MAX_TRACKS):
+            slot_names.append(f'Slot {i + 1}')
+
+        # ── Import dialog ────────────────────────────────────────────────────────────
         from ui.chart_import_dialog import ChartImportDialog
+        dlg = ChartImportDialog(song_meta, tracks, self, slot_names=slot_names)
+        if dlg.exec() != ChartImportDialog.DialogCode.Accepted:
+            return
 
-        song_meta, tracks, initial_bpm, ts_num, ts_den = get_chart_info(chart_text)
+        # ── Convert each enabled preset and write to its slot ────────────────
+        preset_assignments = dlg.get_preset_assignments()
+        if not preset_assignments:
+            QMessageBox.information(
+                self, "Nothing to import",
+                "No preset has a source track selected.  "
+                "Assign at least one source track to import.",
+            )
+            return
 
-        # song.ini (same folder) takes metadata priority over [Song] per spec
-        chart_dir    = os.path.dirname(path)
-        ini_path     = os.path.join(chart_dir, 'song.ini')
+        merged = dict(existing)
+        for cfg, slot_name in preset_assignments:
+            bodies = _convert([cfg])
+            if bodies:
+                merged[slot_name] = bodies[0][1]
+        self._editor.set_tracks(merged)
+        self._rebuild_engines()
+
+        # ── Metadata ─────────────────────────────────────────────────────────────────
+        def _mv(*keys: str) -> str:
+            for k in keys:
+                v = song_meta.get(k, '').strip().strip('"').strip()
+                if v:
+                    return v
+            return ''
+
+        bpm_int = max(20, min(300, round(initial_bpm)))
+
+        if dlg.wants_metadata():
+            self._meta = {}
+            self._meta['title']   = _mv('Name',    'name')
+            self._meta['author']  = _mv('Artist',  'artist')
+            self._meta['charter'] = _mv('Charter', 'charter')
+            self._meta['album']   = _mv('Album',   'album')
+            self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
+            self._meta['bpm']     = str(bpm_int)
+            self._meta['timesig'] = f'{ts_num}/{ts_den}'
+            if self._audio.duration > 0:
+                self._meta['duration'] = format_ms(self._audio.duration)
+            self._transport._bpm.setValue(bpm_int)
+            self._transport.set_timesig(ts_num, ts_den)
+
+        # ── Audio ───────────────────────────────────────────────────────────────────
+        audio_file = _find_chart_audio(chart_dir, song_meta)
+        if audio_file:
+            self._audio.load(os.path.join(chart_dir, audio_file))
+            self._info_bar.setText(f'  \u266b  {audio_file}')
+            self.statusBar().showMessage(
+                f'Imported: {os.path.basename(path)}  \u2014  '
+                f'audio: {audio_file}  \u2014  {bpm_int} BPM  {ts_num}/{ts_den}'
+            )
+        else:
+            self.statusBar().showMessage(
+                f'Imported: {os.path.basename(path)}  \u2014  '
+                f'{bpm_int} BPM  {ts_num}/{ts_den}'
+            )
+
+    def _open_mp3(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Audio File", "",
+            "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
+        )
+        if not path:
+            return
+        self._audio.load(path)
+        self._info_bar.setText(f"  \u266b  {os.path.basename(path)}")
+        self.statusBar().showMessage(f"Loaded: {path}")
+
+    def _open_script(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Project", "",
+            "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except OSError as exc:
+            QMessageBox.critical(self, "Cannot open file", str(exc))
+            return
+        self._meta = self._parse_meta(text)
+        self._sync_meta_to_transport()
+        body = self._strip_meta(text)
+        self._editor.set_tracks(self._parse_tracks(body))
+        self._script_path = path
+        self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
+
+    def _save_script(self) -> None:
         if os.path.isfile(ini_path):
             ini_meta = _parse_song_ini(ini_path)
             # Merge: song.ini wins for keys that exist in both
@@ -399,18 +530,41 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if self._editor.toPlainText().strip():
-            ans = QMessageBox.question(
-                self, "Replace script?",
-                "The editor already contains a script.\n"
-                "Replace it with the imported chart?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
+        track_list, _audio_hint = convert_tracks_per_track(chart_text, configs)
 
-        script, _audio_hint = convert_tracks(chart_text, configs)
-        self._editor.setPlainText(script)
+        # ── Merge / assign tracks ─────────────────────────────────────────────
+        existing    = self._editor.get_tracks()
+        import_meta = True
+
+        from ui.import_merge_dialog import ImportMergeDialog, MAX_TRACKS
+        merge_dlg = ImportMergeDialog(
+            [name for name, _ in track_list],
+            list(existing.keys()),
+            self,
+        )
+        if merge_dlg.exec() != ImportMergeDialog.DialogCode.Accepted:
+            return
+
+        incoming_dict = {name: body for name, body in track_list}
+        merged: dict[str, str] = {}
+        for slot_name, source in merge_dlg.get_slot_assignments():
+            if source is None:
+                if slot_name and slot_name in existing:
+                    merged[slot_name] = existing[slot_name]
+            else:
+                if slot_name:
+                    merged[slot_name] = incoming_dict.get(source, '')
+                else:
+                    final = source
+                    n = 2
+                    while final in merged:
+                        final = f"{source} ({n})"; n += 1
+                    merged[final] = incoming_dict.get(source, '')
+
+        if not merged:
+            return
+        self._editor.set_tracks(merged)
+        import_meta = merge_dlg.wants_metadata()
 
         # ── Populate script metadata from chart info ──────────────────────────
         def _mv(*keys: str) -> str:
@@ -421,29 +575,22 @@ class MainWindow(QMainWindow):
                     return v
             return ''
 
-        self._meta = {}
-        self._meta['title']   = _mv('Name',    'name')
-        self._meta['author']  = _mv('Artist',  'artist')
-        self._meta['charter'] = _mv('Charter', 'charter')
-        self._meta['album']   = _mv('Album',   'album')
-        # Strip GHTCP leading ", " from Year (e.g. ", 1998" → "1998")
-        self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
-        self._meta['bpm']     = str(bpm_int)
-        self._meta['timesig'] = f'{ts_num}/{ts_den}'
-        # Track labels: names of the enabled chart sections in import order
-        enabled_cfgs = [c for c in configs if c.enabled]
-        for i, cfg in enumerate(enabled_cfgs[:4]):
-            self._meta[f'track{i + 1}'] = cfg.track_name
-
-        # Duration: set now if the player already knows it; otherwise
-        # _on_duration will fill it in as soon as audio metadata loads.
-        if self._audio.duration > 0:
-            self._meta['duration'] = format_ms(self._audio.duration)
-
-        # ── Sync transport BPM and time signature ────────────────────────────
         bpm_int = max(20, min(300, round(initial_bpm)))
-        self._transport._bpm.setValue(bpm_int)
-        self._transport.set_timesig(ts_num, ts_den)
+
+        if import_meta:
+            self._meta = {}
+            self._meta['title']   = _mv('Name',    'name')
+            self._meta['author']  = _mv('Artist',  'artist')
+            self._meta['charter'] = _mv('Charter', 'charter')
+            self._meta['album']   = _mv('Album',   'album')
+            self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
+            self._meta['bpm']     = str(bpm_int)
+            self._meta['timesig'] = f'{ts_num}/{ts_den}'
+            if self._audio.duration > 0:
+                self._meta['duration'] = format_ms(self._audio.duration)
+            # ── Sync transport BPM and time signature ────────────────────────────
+            self._transport._bpm.setValue(bpm_int)
+            self._transport.set_timesig(ts_num, ts_den)
 
         # ── Find and load audio ───────────────────────────────────────────────
         audio_file = _find_chart_audio(chart_dir, song_meta)
@@ -478,7 +625,7 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Cannot open file", str(exc))
             return
 
-        from core.midi_importer import get_midi_info, convert_midi_tracks
+        from core.midi_importer import get_midi_info, convert_midi_tracks_per_track
         from ui.chart_import_dialog import ChartImportDialog
 
         try:
@@ -513,18 +660,41 @@ class MainWindow(QMainWindow):
             )
             return
 
-        if self._editor.toPlainText().strip():
-            ans = QMessageBox.question(
-                self, "Replace script?",
-                "The editor already contains a script.\n"
-                "Replace it with the imported MIDI chart?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
+        track_list, _ = convert_midi_tracks_per_track(midi_data, configs)
 
-        script, _ = convert_midi_tracks(midi_data, configs)
-        self._editor.setPlainText(script)
+        # ── Merge / assign tracks ─────────────────────────────────────────────
+        existing    = self._editor.get_tracks()
+        import_meta = True
+
+        from ui.import_merge_dialog import ImportMergeDialog, MAX_TRACKS
+        merge_dlg = ImportMergeDialog(
+            [name for name, _ in track_list],
+            list(existing.keys()),
+            self,
+        )
+        if merge_dlg.exec() != ImportMergeDialog.DialogCode.Accepted:
+            return
+
+        incoming_dict = {name: body for name, body in track_list}
+        merged: dict[str, str] = {}
+        for slot_name, source in merge_dlg.get_slot_assignments():
+            if source is None:
+                if slot_name and slot_name in existing:
+                    merged[slot_name] = existing[slot_name]
+            else:
+                if slot_name:
+                    merged[slot_name] = incoming_dict.get(source, '')
+                else:
+                    final = source
+                    n = 2
+                    while final in merged:
+                        final = f"{source} ({n})"; n += 1
+                    merged[final] = incoming_dict.get(source, '')
+
+        if not merged:
+            return
+        self._editor.set_tracks(merged)
+        import_meta = merge_dlg.wants_metadata()
 
         # ── Populate metadata ─────────────────────────────────────────────────
         def _mv(*keys: str) -> str:
@@ -534,24 +704,22 @@ class MainWindow(QMainWindow):
                     return v
             return ''
 
-        self._meta = {}
-        self._meta['title']   = _mv('Name', 'name')
-        self._meta['author']  = _mv('Artist', 'artist')
-        self._meta['charter'] = _mv('Charter', 'charter')
-        self._meta['album']   = _mv('Album', 'album')
-        self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
-        self._meta['bpm']     = str(max(20, min(300, round(initial_bpm))))
-        self._meta['timesig'] = f'{ts_num}/{ts_den}'
-        enabled_cfgs = [c for c in configs if c.enabled]
-        for i, cfg in enumerate(enabled_cfgs[:4]):
-            self._meta[f'track{i + 1}'] = cfg.track_name
-        if self._audio.duration > 0:
-            self._meta['duration'] = format_ms(self._audio.duration)
-
-        # ── Sync transport ────────────────────────────────────────────────────
         bpm_int = max(20, min(300, round(initial_bpm)))
-        self._transport._bpm.setValue(bpm_int)
-        self._transport.set_timesig(ts_num, ts_den)
+
+        if import_meta:
+            self._meta = {}
+            self._meta['title']   = _mv('Name', 'name')
+            self._meta['author']  = _mv('Artist', 'artist')
+            self._meta['charter'] = _mv('Charter', 'charter')
+            self._meta['album']   = _mv('Album', 'album')
+            self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
+            self._meta['bpm']     = str(bpm_int)
+            self._meta['timesig'] = f'{ts_num}/{ts_den}'
+            if self._audio.duration > 0:
+                self._meta['duration'] = format_ms(self._audio.duration)
+            # ── Sync transport ────────────────────────────────────────────────────
+            self._transport._bpm.setValue(bpm_int)
+            self._transport.set_timesig(ts_num, ts_den)
 
         # ── Audio ─────────────────────────────────────────────────────────────
         audio_file = _find_chart_audio(chart_dir, song_meta)
@@ -583,7 +751,9 @@ class MainWindow(QMainWindow):
             return
         self._meta = self._parse_meta(text)
         self._sync_meta_to_transport()
-        self._editor.setPlainText(text)
+        body = self._strip_meta(text)
+        self._editor.set_tracks(self._parse_tracks(body))
+        self._rebuild_engines()
         self._script_path = path
         self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
 
@@ -616,7 +786,8 @@ class MainWindow(QMainWindow):
         dur_ms = self._audio.duration
         if dur_ms:
             self._meta['duration'] = format_ms(dur_ms)
-        body = self._strip_meta(self._editor.toPlainText())
+        tracks = self._editor.get_tracks()
+        body   = self._build_tracks_body(tracks)
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(self._build_meta_header(self._meta))
@@ -628,34 +799,71 @@ class MainWindow(QMainWindow):
     # ── Runtime slots ─────────────────────────────────────────────────────────
 
     def _on_position(self, pos_ms: int) -> None:
-        self._editor.set_active_line(self._engine.get_active_line_at(pos_ms))
-        states = self._engine.evaluate_at(pos_ms)
+        eng = self._engines.get(self._editor.active_track_name())
+        if eng:
+            self._editor.set_active_line(eng.get_active_line_at(pos_ms))
+        states = self._evaluate_all(pos_ms)
         self._canvas.update_leds(states)
         self._highway.update_position(pos_ms)
         self._highway.update_leds(states)
 
     def _on_seek(self, pos_ms: int) -> None:
-        self._editor.set_active_line(self._engine.get_active_line_at(pos_ms))
-        states = self._engine.evaluate_at(pos_ms)
+        eng = self._engines.get(self._editor.active_track_name())
+        if eng:
+            self._editor.set_active_line(eng.get_active_line_at(pos_ms))
+        states = self._evaluate_all(pos_ms)
         self._canvas.update_leds(states)
         self._highway.update_position(pos_ms)
         self._highway.update_leds(states)
 
     def _on_script_changed(self, text: str) -> None:
-        self._engine.parse(text)
-        self._highway.update_commands(self._engine.commands)
-        self._editor.set_error_lines(self._engine.error_line_set())
-        n = len(self._engine.errors)
+        name = self._editor.active_track_name()
+        eng  = self._engines.setdefault(name, ScriptEngine())
+        eng.parse(text)
+        self._highway.update_commands(eng.commands)
+        self._editor.set_error_lines(eng.error_line_set())
+        n = len(eng.errors)
         if n:
             msgs = "   ".join(
                 f"L{e.line_number}: {e.message}"
-                for e in self._engine.errors[:3])
+                for e in eng.errors[:3])
             suffix = f"   (+{n - 3} more)" if n > 3 else ""
             self.statusBar().showMessage(f"\u26a0  {msgs}{suffix}")
         else:
-            c = len(self._engine.commands)
+            c = len(eng.commands)
             self.statusBar().showMessage(
                 f"Script OK \u2014 {c} command{'s' if c != 1 else ''}")
+
+    def _evaluate_all(self, pos_ms: int) -> dict:
+        """Merge LED states from every track engine (later tracks override earlier)."""
+        states: dict = {}
+        for engine in self._engines.values():
+            states.update(engine.evaluate_at(pos_ms))
+        return states
+
+    def _rebuild_engines(self) -> None:
+        """Re-parse all non-active track engines after a bulk set_tracks call."""
+        tracks = self._editor.get_tracks()
+        active = self._editor.active_track_name()
+        for k in [k for k in self._engines if k not in tracks]:
+            del self._engines[k]
+        for name, body in tracks.items():
+            if name == active:
+                continue   # already up-to-date via _on_script_changed
+            eng = self._engines.setdefault(name, ScriptEngine())
+            eng.parse(body)
+
+    def _on_background_script_changed(self, track_name: str, text: str) -> None:
+        """Re-parse a background track's engine when it is edited in the right editor."""
+        self._engines.setdefault(track_name, ScriptEngine()).parse(text)
+
+    def _on_command_ready(self, line: str) -> None:
+        """Route a toolbox command to the selected target slot."""
+        target = self._toolbox.current_target_track()
+        if target:
+            self._editor.insert_command_line_to(target, line)
+        else:
+            self._editor.insert_command_line(line)
 
     def _on_duration(self, ms: int) -> None:
         """Keep _meta duration in sync whenever audio is (re)loaded."""
@@ -675,6 +883,52 @@ class MainWindow(QMainWindow):
         self._sync_meta_to_transport()
 
     # ── Metadata helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _parse_tracks(body: str) -> dict:
+        """
+        Split a multi-track .echoes body into {track_name: body_text}.
+
+        Track sections start with a bare ``[TrackName]`` header line.
+        If no headers are found the entire body is returned as a single
+        'Default' track.
+        """
+        tracks: dict[str, str] = {}
+        current_name: str | None = None
+        current_lines: list[str] = []
+
+        for line in body.splitlines(keepends=True):
+            m = re.match(r'^\[([^\]]+)\]\s*$', line.strip())
+            if m:
+                if current_name is not None:
+                    tracks[current_name] = ''.join(current_lines).strip('\n')
+                current_name = m.group(1)
+                current_lines = []
+            else:
+                if current_name is not None:
+                    current_lines.append(line)
+
+        if current_name is not None:
+            tracks[current_name] = ''.join(current_lines).strip('\n')
+
+        if not tracks:
+            stripped = body.strip()
+            if stripped:
+                tracks['Default'] = stripped
+
+        return tracks
+
+    @staticmethod
+    def _build_tracks_body(tracks: dict) -> str:
+        """Serialise {track_name: body_text} to multi-track file format."""
+        parts: list[str] = []
+        for name, body in tracks.items():
+            parts.append(f'[{name}]')
+            b = body.strip('\n')
+            if b:
+                parts.append(b)
+            parts.append('')
+        return '\n'.join(parts) + '\n' if parts else ''
 
     @staticmethod
     def _parse_meta(text: str) -> dict:
@@ -786,7 +1040,8 @@ class MainWindow(QMainWindow):
             return
 
         to_v2  = rb_v1_to_v2.isChecked()
-        source = self._editor.toPlainText()
+        ed     = self._editor.left_editor
+        source = ed.toPlainText()
         result = remap_hw_version(source, to_v2)
 
         if result == source:
@@ -799,7 +1054,7 @@ class MainWindow(QMainWindow):
             return
 
         direction = "V1 → V2" if to_v2 else "V2 → V1"
-        self._editor.setPlainText(result)
+        ed.setPlainText(result)
         self.statusBar().showMessage(f"Hardware version converted: {direction}")
 
     # ── Zone right-click → script insertion ────────────────────────────────
@@ -834,7 +1089,8 @@ class MainWindow(QMainWindow):
         order.  Selects the editable parameter region so the user can type
         immediately.
         """
-        doc   = self._editor.document()
+        ed    = self._editor.left_editor
+        doc   = ed.document()
         parts = template.split()
         ts_ms = _parse_timestamp(parts[0]) or 0
 
@@ -863,7 +1119,7 @@ class MainWindow(QMainWindow):
 
         # Select the parameter region (between command keyword and LED-SPEC)
         # so the user can type the colours / values straight away
-        new_blk     = doc.findBlockByNumber(new_block_num)
+        new_blk      = doc.findBlockByNumber(new_block_num)
         params_start = len(parts[0]) + 1 + len(parts[1]) + 1   # after "M:SS CMD "
         params_end   = len(template) - len(parts[-1]) - 1       # before " LED-SPEC"
 
@@ -871,6 +1127,6 @@ class MainWindow(QMainWindow):
         cur.setPosition(new_blk.position() + params_end,
                         QTextCursor.MoveMode.KeepAnchor)
 
-        self._editor.setTextCursor(cur)
-        self._editor.ensureCursorVisible()
-        self._editor.setFocus()
+        ed.setTextCursor(cur)
+        ed.ensureCursorVisible()
+        ed.setFocus()

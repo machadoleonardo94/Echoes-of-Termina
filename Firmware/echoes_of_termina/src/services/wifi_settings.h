@@ -95,7 +95,7 @@ bool setup_WIFI(bool portal_enabled)
 
         wifiManager.setConfigPortalTimeout(portal_enabled ? 60 : 1);
 
-        String hostname = "EquipaPro Automation";
+        String hostname = "Echoes of Termina";
 
         wifiManager.setHostname(hostname);
 

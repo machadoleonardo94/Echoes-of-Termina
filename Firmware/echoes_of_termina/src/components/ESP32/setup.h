@@ -16,6 +16,10 @@ void setup_ESP32()
     esp_task_wdt_init(180, true);
     esp_task_wdt_add(NULL);
 
+    adc1_config_width(ADC_WIDTH_BIT_12);
+    adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_12);
+    esp_adc_cal_characterize(ADC_UNIT_1, ADC_ATTEN_DB_12, ADC_WIDTH_BIT_12, 1100, &adc_cal);
+
     Serial.println("[ESP32] SETUP FINISHED!");
 }
 
@@ -23,8 +27,7 @@ void setup_GPIOs()
 {
     Serial.println("[GPIO] SETUP STARTED!");
 
-    //* Digital Inputs
-    pinMode(prog_switch, INPUT); // Programming mode switch
+    // prog_switch (GPIO 0) is configured in setup_button_interrupt()
 
     Serial.println("[GPIO] SETUP FINISHED!");
 }

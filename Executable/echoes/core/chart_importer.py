@@ -490,3 +490,73 @@ def convert_tracks(
             seen_at[key] = ms
 
     return '\n'.join(header_parts + final), audio_file
+
+
+def convert_tracks_per_track(
+    chart_text: str,
+    configs: list[TrackConfig],
+) -> tuple[list[tuple[str, str]], Optional[str]]:
+    """
+    Convert a .chart file into separate per-track echoes script bodies.
+
+    Returns (track_list, audio_filename_or_None) where track_list is a list
+    of (track_name, script_body) for each enabled TrackConfig.
+    """
+    song_meta, sync_entries = _parse_song_and_sync(chart_text)
+
+    resolution = int(song_meta.get('Resolution', '192'))
+    audio_file = song_meta.get('MusicStream') or None
+    tempomap   = _build_tempomap(sync_entries, resolution)
+
+    track_scripts: list[tuple[str, str]] = []
+
+    for cfg in configs:
+        if not cfg.enabled:
+            continue
+
+        fret_map     = cfg.get_fret_map()
+        note_entries = _parse_notes_for_section(chart_text, cfg.track_name)
+        cmd_lines: list[tuple[float, str]] = []
+
+        for tick, fret, dur_ticks in note_entries:
+            leds = fret_map.get(fret, '').strip()
+            if not leds:
+                continue
+            r, g, b  = cfg.get_fret_color(fret)
+            start_ms = _tick_to_ms(tick, tempomap)
+            end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
+            dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
+            leds     = fret_map[fret]
+            t        = _fmt_time(start_ms)
+
+            if dur_ms < cfg.short_ms:
+                cmd_lines.append((
+                    start_ms,
+                    f'{t}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                ))
+            else:
+                cmd_lines.append((
+                    start_ms,
+                    f'{t}  SET {r} {g} {b}  {leds}'
+                ))
+                fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+                cmd_lines.append((
+                    fade_ms,
+                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                ))
+
+        cmd_lines.sort(key=lambda x: x[0])
+        seen_at: dict[str, float] = {}
+        final: list[str] = []
+        for ms, line in cmd_lines:
+            key  = line.split('  ', 1)[1]
+            last = seen_at.get(key, -9999)
+            if ms - last > 50:
+                final.append(line)
+                seen_at[key] = ms
+
+        header_parts = ['# Imported from Clone Hero .chart', '']
+        body = '\n'.join(header_parts + final)
+        track_scripts.append((cfg.track_name, body))
+
+    return track_scripts, audio_file

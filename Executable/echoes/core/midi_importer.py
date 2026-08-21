@@ -316,3 +316,73 @@ def convert_midi_tracks(
     ]
 
     return '\n'.join(header + final), None
+
+
+def convert_midi_tracks_per_track(
+    data:    bytes,
+    configs: list[TrackConfig],
+) -> tuple[list[tuple[str, str]], None]:
+    """
+    Convert a notes.mid binary into separate per-track echoes script bodies.
+
+    Returns (track_list, None) where track_list is a list of
+    (track_name, script_body) for each enabled TrackConfig.
+    """
+    mid      = _parse(data)
+    tempomap = _build_tempomap(mid.sync, mid.ticks)
+
+    note_lookup: dict[str, list[tuple[int, int, int]]] = {}
+    for name, notes in mid.tracks:
+        note_lookup[name] = notes
+
+    track_scripts: list[tuple[str, str]] = []
+
+    for cfg in configs:
+        if not cfg.enabled:
+            continue
+
+        fret_map = cfg.get_fret_map()
+        notes    = note_lookup.get(cfg.track_name, [])
+        cmd_lines: list[tuple[float, str]] = []
+
+        for tick, fret, dur_ticks in notes:
+            leds = fret_map.get(fret, '').strip()
+            if not leds:
+                continue
+            r, g, b  = cfg.get_fret_color(fret)
+            start_ms = _tick_to_ms(tick, tempomap)
+            end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
+            dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
+            t        = _fmt_time(start_ms)
+
+            if dur_ms < cfg.short_ms:
+                cmd_lines.append((
+                    start_ms,
+                    f'{t}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                ))
+            else:
+                cmd_lines.append((
+                    start_ms,
+                    f'{t}  SET {r} {g} {b}  {leds}'
+                ))
+                fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+                cmd_lines.append((
+                    fade_ms,
+                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                ))
+
+        cmd_lines.sort(key=lambda x: x[0])
+        seen_at: dict[str, float] = {}
+        final: list[str] = []
+        for ms, line in cmd_lines:
+            key  = line.split('  ', 1)[1]
+            last = seen_at.get(key, -9999)
+            if ms - last > 50:
+                final.append(line)
+                seen_at[key] = ms
+
+        header_parts = ['# Imported from notes.mid', '']
+        body = '\n'.join(header_parts + final)
+        track_scripts.append((cfg.track_name, body))
+
+    return track_scripts, None

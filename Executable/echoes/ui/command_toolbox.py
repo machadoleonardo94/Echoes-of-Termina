@@ -185,6 +185,28 @@ class CommandToolbox(QWidget):
         row.addWidget(self._cmd_combo)
         row.addWidget(self._stack, stretch=1)
 
+        # Target slot dropdown  (populated externally via set_track_names)
+        _sep = QLabel("|")
+        _sep.setStyleSheet("color:#404040; font:14px 'Segoe UI';")
+        row.addWidget(_sep)
+
+        _slot_lbl = QLabel("→")
+        _slot_lbl.setStyleSheet("color:#666666; font:11px 'Segoe UI';")
+        row.addWidget(_slot_lbl)
+
+        self._slot_combo = QComboBox()
+        self._slot_combo.setFixedSize(140, 26)
+        self._slot_combo.setToolTip("Target slot — the ADD button inserts into this track")
+        self._slot_combo.setStyleSheet(
+            "QComboBox { background:#2a2a2a; color:#9cdcfe; "
+            "border:1px solid #404040; border-radius:3px; "
+            "padding:2px 6px; font:11px 'Segoe UI'; }"
+            "QComboBox::drop-down { border:none; width:14px; }"
+            "QComboBox QAbstractItemView { background:#2a2a2a; color:#9cdcfe; "
+            "selection-background-color:#005f5f; }"
+        )
+        row.addWidget(self._slot_combo)
+
     # ── Wiring ────────────────────────────────────────────────────────────────
 
     def _wire(self) -> None:
@@ -229,3 +251,20 @@ class CommandToolbox(QWidget):
                     f"{self._rmp_led.text().strip() or '*'}")
 
         self.command_ready.emit(line)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_track_names(self, names: list[str]) -> None:
+        """Repopulate the target slot dropdown, preserving the current selection."""
+        current = self._slot_combo.currentText()
+        self._slot_combo.blockSignals(True)
+        self._slot_combo.clear()
+        self._slot_combo.addItems(names)
+        idx = self._slot_combo.findText(current)
+        if idx >= 0:
+            self._slot_combo.setCurrentIndex(idx)
+        self._slot_combo.blockSignals(False)
+
+    def current_target_track(self) -> str:
+        """Return the currently selected target slot name."""
+        return self._slot_combo.currentText()

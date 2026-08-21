@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.chart_importer import GH_FRET_COLORS, LED_PRESETS, TrackConfig
+from ui.script_editor   import MAX_TRACKS
 
 
 # ── Preferences file ──────────────────────────────────────────────────────────
@@ -91,32 +92,36 @@ def _hline() -> QFrame:
     return f
 
 
-# ── Single track configuration block ─────────────────────────────────────────
+# ── Preset configuration block ────────────────────────────────────────────────
 
-class _TrackRow(QWidget):
+class _PresetRow(QWidget):
     """
-    Vertical block:
-      ┌ header ── [x] TrackName  (N)  Preset [combo]  Short [spin]  Fade [spin]  Lead [spin]
-      │ fret 1 ──  Fret 1  LEDs: [___________]  [1 ●]
-      │ fret 2 ──  Fret 2  LEDs: [___________]  [2 ●]
-      │   …
-      └ fret 5 ──  Fret 5  LEDs: [___________]  [5 ●]
+    One of six persistent preset slots.
+
+    Each row stores a reusable LED / colour / timing configuration that is
+    independent of any particular source file.  Two extra dropdowns let the
+    user wire it to the import at hand:
+
+      Source  — which chart track feeds this preset  ("— None —" = skip)
+      → Slot  — which project slot receives the output
+
+    The LED / colour / timing settings are saved by preset index so they
+    survive across imports of different files.
     """
 
     def __init__(
         self,
-        track_name: str,
-        note_count: int,
-        track_idx:  int,
-        prefs:      dict | None,
+        preset_idx:       int,
+        available_tracks: list[str],
+        slot_names:       list[str],
+        prefs:            dict | None,
         parent=None,
     ) -> None:
         super().__init__(parent)
-        self._track_name = track_name
-        self._track_idx  = track_idx
+        self._preset_idx = preset_idx
 
         # ── initial values from prefs or defaults ─────────────────────────────
-        default_preset = _DEFAULT_PRESETS[track_idx % len(_DEFAULT_PRESETS)]
+        default_preset = _DEFAULT_PRESETS[preset_idx % len(_DEFAULT_PRESETS)]
         default_leds   = [LED_PRESETS[default_preset][f] for f in range(5)]
 
         if prefs:
@@ -149,24 +154,36 @@ class _TrackRow(QWidget):
         hrow.setContentsMargins(0, 0, 0, 0)
         hrow.setSpacing(10)
 
-        self._check = QCheckBox()
-        self._check.setChecked(True)
-        self._check.setToolTip("Include this track in the import")
-        self._check.setFixedWidth(18)
-        hrow.addWidget(self._check)
+        preset_lbl = QLabel(f"Preset {preset_idx + 1}")
+        preset_lbl.setStyleSheet(
+            "color:#e0e0e0; font:bold 11px 'Segoe UI'; min-width:62px;")
+        hrow.addWidget(preset_lbl)
 
-        name_lbl = QLabel(track_name)
-        name_lbl.setStyleSheet(
-            "color:#e0e0e0; font:bold 11px 'Segoe UI'; min-width:160px;")
-        hrow.addWidget(name_lbl)
+        hrow.addWidget(_dim("Source"))
+        self._source_combo = QComboBox()
+        self._source_combo.setFixedWidth(180)
+        self._source_combo.setToolTip(
+            "Which chart track feeds this preset.\n"
+            "'\u2014 None \u2014' skips this preset row.")
+        self._source_combo.addItem("\u2014 None \u2014", None)
+        for t in available_tracks:
+            self._source_combo.addItem(t, t)
+        # Auto-assign: preset N defaults to the N-th available track
+        if preset_idx < len(available_tracks):
+            self._source_combo.setCurrentIndex(preset_idx + 1)  # +1 for None item
+        hrow.addWidget(self._source_combo)
 
-        count_lbl = QLabel(f"({note_count} notes)")
-        count_lbl.setStyleSheet("color:#666; font:11px 'Segoe UI'; min-width:75px;")
-        hrow.addWidget(count_lbl)
+        hrow.addWidget(_dim("\u2192 Slot"))
+        self._slot_combo = QComboBox()
+        self._slot_combo.setFixedWidth(140)
+        self._slot_combo.setToolTip("Project slot this preset's output is written to.")
+        for s in slot_names:
+            self._slot_combo.addItem(s)
+        if preset_idx < len(slot_names):
+            self._slot_combo.setCurrentIndex(preset_idx)
+        hrow.addWidget(self._slot_combo)
 
         hrow.addWidget(_dim("Preset"))
-
-        # ── LED preset combo ──────────────────────────────────────────────────
         self._preset = QComboBox()
         self._preset.setFixedWidth(80)
         for pname, tip in _PRESET_TIPS.items():
@@ -197,7 +214,7 @@ class _TrackRow(QWidget):
         self._fade.setSuffix("%"); self._fade.setFixedWidth(62)
         self._fade.setToolTip(
             "Decay rate in % per second.\n"
-            "Higher = quicker fade to black  (e.g. 90 ≈ 1 s,  50 ≈ 7 s).")
+            "Higher = quicker fade to black  (e.g. 90 \u2248 1 s,  50 \u2248 7 s).")
         hrow.addWidget(self._fade)
 
         hrow.addWidget(_dim("Lead"))
@@ -211,18 +228,17 @@ class _TrackRow(QWidget):
         hrow.addStretch()
         outer.addWidget(header)
 
-        # ════════ per-fret columns (one horizontal group per fret) ══════════════
+        # ════════ per-fret columns ═══════════════════════════════════════════
         frets_widget = QWidget()
         frets_widget.setStyleSheet("background:transparent;")
         frow = QHBoxLayout(frets_widget)
         frow.setContentsMargins(0, 2, 0, 2)
         frow.setSpacing(10)
 
-        self._led_inputs: list[QLineEdit]    = []
-        self._fret_btns:  list[QPushButton]  = []
+        self._led_inputs: list[QLineEdit]   = []
+        self._fret_btns:  list[QPushButton] = []
 
         for fret in range(5):
-            # Each fret is a small vertical cell: label / LED input / color btn
             cell = QWidget()
             cell.setStyleSheet("background:transparent;")
             cv = QVBoxLayout(cell)
@@ -256,16 +272,25 @@ class _TrackRow(QWidget):
         self._refresh_all_btns()
         outer.addWidget(frets_widget)
 
-        # ── set initial preset selection (detect from loaded LED values) ──────
+        # initial preset selection
         self._suppress_preset_signal = False
         self._sync_preset_combo(init_leds)
 
-        # ── wire enable/disable ───────────────────────────────────────────────
-        self._track_controls: list[QWidget] = (
-            [self._preset] + self._led_inputs + self._fret_btns +
+        # Controls that follow source selection
+        self._cfg_controls: list[QWidget] = (
+            [self._slot_combo, self._preset] + self._led_inputs + self._fret_btns +
             [self._short, self._fade, self._lead]
         )
-        self._check.toggled.connect(self._on_toggle)
+        self._source_combo.currentIndexChanged.connect(self._on_source_changed)
+        self._on_source_changed()   # set initial enabled state
+
+    # ── Source change ─────────────────────────────────────────────────────────
+
+    def _on_source_changed(self) -> None:
+        """Enable config controls only when a real source track is selected."""
+        enabled = self._source_combo.currentData() is not None
+        for w in self._cfg_controls:
+            w.setEnabled(enabled)
 
     # ── Preset / LED sync ─────────────────────────────────────────────────────
 
@@ -282,7 +307,6 @@ class _TrackRow(QWidget):
         self._preset.setToolTip(tip)
 
     def _on_led_manually_edited(self) -> None:
-        """Switch to 'Custom' when the user edits any LED field directly."""
         self._suppress_preset_signal = True
         idx = self._preset.findText('Custom')
         if idx >= 0:
@@ -290,7 +314,6 @@ class _TrackRow(QWidget):
         self._suppress_preset_signal = False
 
     def _sync_preset_combo(self, leds: list[str]) -> None:
-        """Select the named preset whose mapping matches *leds*, else 'Custom'."""
         self._suppress_preset_signal = True
         for pname, fmap in LED_PRESETS.items():
             if all(fmap.get(f, '') == leds[f] for f in range(5)):
@@ -329,26 +352,24 @@ class _TrackRow(QWidget):
             f"QPushButton:hover {{ border-color:#007acc; }}"
         )
         btn.setToolTip(
-            f"Fret {fret + 1}  —  "
-            f"rgb({c.red()}, {c.green()}, {c.blue()})  —  click to change"
+            f"Fret {fret + 1}  \u2014  "
+            f"rgb({c.red()}, {c.green()}, {c.blue()})  \u2014  click to change"
         )
 
     def _refresh_all_btns(self) -> None:
         for fret in range(5):
             self._refresh_fret_btn(fret)
 
-    # ── Enable/disable ────────────────────────────────────────────────────────
-
-    def _on_toggle(self, on: bool) -> None:
-        for w in self._track_controls:
-            w.setEnabled(on)
-
     # ── Public interface ──────────────────────────────────────────────────────
 
-    def get_config(self) -> TrackConfig:
+    def get_config(self) -> 'TrackConfig | None':
+        """Return a TrackConfig if a source is selected, else None (preset disabled)."""
+        source = self._source_combo.currentData()
+        if source is None:
+            return None
         return TrackConfig(
-            track_name   = self._track_name,
-            enabled      = self._check.isChecked(),
+            track_name   = source,
+            enabled      = True,
             fret_colors  = {
                 f: (c.red(), c.green(), c.blue())
                 for f, c in self._fret_colors.items()
@@ -362,8 +383,11 @@ class _TrackRow(QWidget):
             fade_lead_ms = self._lead.value(),
         )
 
+    def get_slot_target(self) -> str:
+        return self._slot_combo.currentText()
+
     def get_prefs(self) -> dict:
-        """Serializable snapshot of current values for persistence."""
+        """Serializable snapshot of LED / colour / timing settings for persistence."""
         return {
             'fret_colors': [
                 [self._fret_colors[f].red(),
@@ -382,24 +406,28 @@ class _TrackRow(QWidget):
 
 class ChartImportDialog(QDialog):
     """
-    Chart import configuration dialog.
+    Import configuration dialog (used for both .chart and .mid files).
 
-    Parameters
-    ----------
-    song_meta : dict   — {key: value} from the [Song] section
-    tracks    : list   — [(section_name, note_count), …] in file order
+    Shows the [Song] metadata, a metadata-import checkbox, and one
+    *_PresetRow* per project slot (always MAX_TRACKS = 6 rows).  Each row
+    stores a reusable LED / colour / timing configuration and lets the user
+    pick the source chart track and target project slot independently.
     """
 
     def __init__(
         self,
-        song_meta: dict[str, str],
-        tracks: list[tuple[str, int]],
+        song_meta:  dict[str, str],
+        tracks:     list[tuple[str, int]],
         parent=None,
+        slot_names: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Import .chart")
-        self.setMinimumWidth(680)
+        self.setWindowTitle("Import Tracks")
+        self.setMinimumWidth(720)
         self.setStyleSheet("background:#1e1e1e; " + _BASE)
+
+        if not slot_names:
+            slot_names = [f"Slot {i + 1}" for i in range(MAX_TRACKS)]
 
         root = QVBoxLayout(self)
         root.setSpacing(10)
@@ -433,14 +461,25 @@ class ChartImportDialog(QDialog):
             )
         root.addWidget(info)
 
-        # ── Tracks ────────────────────────────────────────────────────────────
-        n = len(tracks)
-        tracks_lbl = QLabel(
-            f"Tracks found: {n}  "
-            f"{'—  configure each track below' if n else '— no playable tracks detected'}"            + ("  \u2014  max 4 can be enabled" if n > 4 else "")        )
-        tracks_lbl.setStyleSheet("color:#aaa; font:bold 11px 'Segoe UI';")
-        root.addWidget(tracks_lbl)
+        # ── Metadata checkbox ─────────────────────────────────────────────────
+        self._meta_chk = QCheckBox(
+            "Import song metadata  (title, BPM, time signature, album, year\u2026)")
+        self._meta_chk.setChecked(True)
+        root.addWidget(self._meta_chk)
 
+        # ── Info label ────────────────────────────────────────────────────────
+        n = len(tracks)
+        available_tracks = [name for name, _ in tracks]
+        info_lbl = QLabel(
+            f"Tracks found in file: {n}  \u2014  "
+            "assign source tracks to the 6 preset slots below"
+            if n else
+            "No playable tracks detected in this file."
+        )
+        info_lbl.setStyleSheet("color:#aaa; font:bold 11px 'Segoe UI';")
+        root.addWidget(info_lbl)
+
+        # ── Preset rows (always MAX_TRACKS) ───────────────────────────────────
         prefs = _load_prefs()
 
         scroll = QScrollArea()
@@ -457,53 +496,32 @@ class ChartImportDialog(QDialog):
         inner_layout.setContentsMargins(0, 4, 0, 4)
         inner_layout.setSpacing(0)
 
-        self._rows: list[_TrackRow] = []
-
-        if tracks:
-            for i, (name, count) in enumerate(tracks):
-                track_prefs = prefs.get(f'track_{i}')
-                row = _TrackRow(name, count, i, track_prefs, inner)
-                inner_layout.addWidget(row)
-                if i < len(tracks) - 1:
-                    sep = QFrame()
-                    sep.setFrameShape(QFrame.Shape.HLine)
-                    sep.setStyleSheet("color:#3a3a3a; margin:0 6px;")
-                    inner_layout.addWidget(sep)
-                self._rows.append(row)
-        else:
-            empty = QLabel("  No playable note sections found in this file.")
-            empty.setStyleSheet("color:#666; font:11px 'Segoe UI'; padding:8px;")
-            inner_layout.addWidget(empty)
+        self._rows: list[_PresetRow] = []
+        for i in range(MAX_TRACKS):
+            row = _PresetRow(i, available_tracks, slot_names, prefs.get(f'track_{i}'), inner)
+            inner_layout.addWidget(row)
+            if i < MAX_TRACKS - 1:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setStyleSheet("color:#3a3a3a; margin:0 6px;")
+                inner_layout.addWidget(sep)
+            self._rows.append(row)
 
         inner_layout.addStretch()
         scroll.setWidget(inner)
-        # Height: ~90px per track (header + 5 fret rows)
-        scroll.setMinimumHeight(min(30 + len(tracks) * 100, 500))
+        scroll.setMinimumHeight(min(30 + MAX_TRACKS * 100, 540))
         root.addWidget(scroll)
-
-        # ── Enforce 4-track maximum ───────────────────────────────────────────
-        # Rows beyond the 4th start unchecked; all checkboxes report to the
-        # limit-enforcer so toggling is capped at 4 enabled at any time.
-        for i, row in enumerate(self._rows):
-            if i >= 4:
-                row._check.setChecked(False)   # fires _on_toggle → disables controls
-        for row in self._rows:
-            row._check.toggled.connect(self._update_track_limits)
-        self._update_track_limits()  # set initial disabled/tooltip state
 
         # ── Buttons ───────────────────────────────────────────────────────────
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok |
-            QDialogButtonBox.StandardButton.Cancel
+            QDialogButtonBox.StandardButton.Cancel,
         )
         buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Import")
-        ok_btn = buttons.button(QDialogButtonBox.StandardButton.Ok)
-        ok_btn.setEnabled(bool(tracks))
-        ok_btn.setStyleSheet(
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setStyleSheet(
             "QPushButton { background:#005f9e; color:#fff; border:none;"
             " border-radius:3px; padding:4px 16px; font:11px 'Segoe UI'; }"
             "QPushButton:hover { background:#0078c8; }"
-            "QPushButton:disabled { background:#3a3a3a; color:#666; }"
         )
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setStyleSheet(
             "QPushButton { background:#3a3a3a; color:#ccc; border:none;"
@@ -514,33 +532,29 @@ class ChartImportDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
-    # ── Track-limit enforcement ───────────────────────────────────────────────
-
-    def _update_track_limits(self) -> None:
-        """Disable unchecked track checkboxes once 4 are already selected."""
-        enabled = sum(1 for r in self._rows if r._check.isChecked())
-        at_max  = enabled >= 4
-        for row in self._rows:
-            if row._check.isChecked():
-                row._check.setEnabled(True)
-                row._check.setToolTip("Include this track in the import")
-            else:
-                row._check.setEnabled(not at_max)
-                row._check.setToolTip(
-                    "4 tracks already selected \u2014 deselect another to enable this one"
-                    if at_max else
-                    "Include this track in the import"
-                )
-
-    # ── Override accept to save prefs ─────────────────────────────────────────
+    # ── Save prefs on accept ──────────────────────────────────────────────────
 
     def accept(self) -> None:
         data = {f'track_{i}': row.get_prefs() for i, row in enumerate(self._rows)}
         _save_prefs(data)
         super().accept()
 
-    # ── Public ───────────────────────────────────────────────────────────────
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    def get_configs(self) -> list[TrackConfig]:
-        """Return a TrackConfig for every row (enabled or not)."""
-        return [row.get_config() for row in self._rows]
+    def get_preset_assignments(self) -> list[tuple['TrackConfig', str]]:
+        """
+        Return ``[(TrackConfig, slot_name)]`` for each enabled preset row.
+
+        A row is enabled when its Source dropdown is not "— None —".
+        The same source track may appear in multiple rows (different LED configs).
+        """
+        result = []
+        for row in self._rows:
+            cfg = row.get_config()
+            if cfg is not None:
+                result.append((cfg, row.get_slot_target()))
+        return result
+
+    def wants_metadata(self) -> bool:
+        """True if the user wants to overwrite the project's song metadata."""
+        return self._meta_chk.isChecked()

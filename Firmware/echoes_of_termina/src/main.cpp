@@ -1,4 +1,5 @@
 #include "shared/dependencies.h"
+#include <driver/rtc_io.h>
 
 void setup()
 {
@@ -13,25 +14,34 @@ void setup()
   setup_ESP32(); //* Enables watchdog
   setup_GPIOs(); //* Configures GPIOs
 
-  if (digitalRead(button_input) == HIGH)
-  {
-    Serial.println("Enabling WiFi AP for debug\n");
-    debugWifi = setup_WIFI(); //* Setups AP for control
-  }
+  majora.begin();
+  majora.show();
+
+  Wire.begin(i2c_sda, i2c_scl);
+  Serial.printf("I2C initialized (SDA=%d, SCL=%d)\n", i2c_sda, i2c_scl);
+
+  pinMode(button, INPUT_PULLDOWN);
+  rtc_gpio_hold_dis(GPIO_NUM_13); // Release any hold from previous restart
+  pinMode(latch, OUTPUT);
+  digitalWrite(latch, HIGH); // Latch power on
+
+  setup_button_interrupt(); //* Interrupt-driven triple-press detection on GPIO 0
+
+  delay(1000);
+
+  setup_SDCARD(); //* Initializes SD card
+
+  // load_lightshow("/storms.echoes");
+
+  //* --- MODE SELECTION ---
+  //* Mode is read from NVS. Triple-press the button at runtime to switch.
+  // active_mode = load_mode();
+  active_mode = MODE_WIFI;
+
+  if (active_mode == MODE_BLUETOOTH)
+    setup_bluetooth_mode();
   else
-  {
-    WiFi.mode(WIFI_OFF);
-  }
-
-  // Streams audio data to the ESP32
-  audio.begin();
-
-  // Re-connects to last connected device
-  audio.reconnect();
-
-  // Outputs the received data to an I2S DAC MAX98357A
-  audio.I2S(I2C_BCLK, I2C_DOUT, I2C_LRC);
-  audio.volume(1.0);
+    setup_wifi_mode();
 
   Serial.println("\n---------------------------------------------------");
   Serial.println("----------------  END OF SETUP --------------------");
@@ -41,8 +51,14 @@ void setup()
 
 void loop()
 {
-  if (debugWifi) // Wifi is disabled unless debug mode is enabled to avoid ADC interference
+  if (active_mode == MODE_WIFI)
+  {
+    handle_wifi_portal();
     ArduinoOTA.handle();
+  }
+
+  check_button();
+  // handle_led_scripts();
 
   esp_task_wdt_reset();
 }
