@@ -2,7 +2,6 @@
 #define SETUP_ESP32
 
 #include "shared/dependencies.h"
-#include "components/ESP32/features/update_firmware_ota.h"
 #include "driver/adc.h"
 #include "esp_adc_cal.h"
 

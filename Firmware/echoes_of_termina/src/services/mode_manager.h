@@ -6,7 +6,7 @@
 //*!
 //*!  BLUETOOTH mode (default):
 //*!    • WiFi radio disabled
-//*!    • btAudio A2DP sink started as "Echoes_of_Termina"
+//*!    • ESP32-A2DP sink started as "Echoes_of_Termina"
 //*!    • I2S output routed to MAX98357A DAC
 //*!    • Reconnects to last paired device automatically
 //*!
@@ -76,10 +76,20 @@ void setup_bluetooth_mode()
     WiFi.mode(WIFI_OFF);
     delay(100);
 
-    // A2DP sink: receives audio from paired device, outputs via I2S DAC
-    audio.begin();
-    audio.I2S(I2C_BCLK, I2C_DOUT, I2C_LRC);
-    audio.volume(1.0);
+    // Route A2DP audio to the MAX98357A DAC over the legacy I2S driver
+    // (A2DP_LEGACY_I2S_SUPPORT=1 is set in platformio.ini for ESP-IDF 5.x).
+    i2s_pin_config_t pin_cfg;
+    pin_cfg.mck_io_num = I2S_PIN_NO_CHANGE;
+    pin_cfg.bck_io_num = I2C_BCLK;   // 17
+    pin_cfg.ws_io_num = I2C_LRC;     // 18
+    pin_cfg.data_out_num = I2C_DOUT; // 16
+    pin_cfg.data_in_num = I2S_PIN_NO_CHANGE;
+    a2dp_sink.set_pin_config(pin_cfg);
+
+    // Reconnect to the last paired device (a few attempts) and start the sink.
+    a2dp_sink.set_auto_reconnect(true, 3);
+    a2dp_sink.start("Echoes_of_Termina");
+    a2dp_sink.set_volume(127); // full volume (range 0..127)
 
     Serial.println("[BT] Ready — pair with: Echoes_of_Termina");
 }

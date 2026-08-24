@@ -215,8 +215,18 @@ class TransportBar(QWidget):
         row.addWidget(self._btn_next_h)
         row.addWidget(self._btn_next_1)
         row.addSpacing(4)
+
+        # ── Loaded-track name (always visible, elided on narrow windows) ─────
+        self._track_name = ""
+        self._track_label = QLabel("")
+        self._track_label.setMinimumWidth(40)
+        self._track_label.setStyleSheet(
+            "color:#888888; font:11px 'Segoe UI';")
+        self._track_label.setToolTip("Loaded audio")
+        row.addWidget(self._track_label, stretch=1)
+
         row.addWidget(self._lbl_pos)
-        row.addWidget(self._seek, stretch=1)
+        row.addWidget(self._seek, stretch=2)
         row.addWidget(self._lbl_dur)
         row.addSpacing(4)
         row.addWidget(self._lbl_vol)
@@ -293,6 +303,22 @@ class TransportBar(QWidget):
 
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def set_track_name(self, name: str) -> None:
+        """Show the loaded audio file name (elided when space is tight)."""
+        self._track_name = name or ""
+        self._update_track_label()
+
+    def _update_track_label(self) -> None:
+        fm = self._track_label.fontMetrics()
+        self._track_label.setText(fm.elidedText(
+            self._track_name, Qt.TextElideMode.ElideMiddle,
+            max(1, self._track_label.width())))
+        self._track_label.setToolTip(self._track_name or "Loaded audio")
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._update_track_label()
 
     def set_timesig(self, num: int, den: int) -> None:
         """Push a complete time signature into the transport bar widgets."""

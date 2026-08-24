@@ -15,7 +15,7 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
-VERSION  = "0.5.0"
+VERSION  = "0.6.0"
 HERE     = Path(__file__).resolve().parent   # tools/echoes/
 DIST_DIR = HERE / "dist"
 ZIP_PATH = DIST_DIR / f"Echoes_v{VERSION}.zip"
@@ -117,8 +117,11 @@ if __name__ == "__main__":
     import importlib, sys as _sys
     _sys.path.insert(0, str(HERE))
     for _mod in ("core.script_engine", "core.audio_player",
-                 "core.dxf_loader", "ui.transport_bar",
-                 "ui.script_editor", "ui.led_canvas", "ui.main_window"):
+                 "core.audio_converter", "core.device_discovery",
+                 "core.device_media", "core.dxf_loader",
+                 "ui.transport_bar",
+                 "ui.script_editor", "ui.led_canvas", "ui.main_window",
+                 "ui.track_mix_dialog"):
         try:
             importlib.import_module(_mod)
         except Exception as exc:

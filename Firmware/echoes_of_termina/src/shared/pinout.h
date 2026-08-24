@@ -8,7 +8,7 @@
 //* Outputs:
 #define LED_output 25
 
-//* I2S PINS (I2S_NUM_0 — MAX98357A speaker via btAudio):
+//* I2S PINS (I2S_NUM_0 — MAX98357A speaker via ESP32-A2DP sink):
 #define I2C_DOUT 16
 #define I2C_BCLK 17
 #define I2C_LRC 18
@@ -41,7 +41,7 @@
 //* Outputs:
 #define LED_output 32
 
-//* I2S PINS (I2S_NUM_0 — MAX98357A speaker via btAudio):
+//* I2S PINS (I2S_NUM_0 — MAX98357A speaker via ESP32-A2DP sink):
 #define I2C_DOUT 16
 #define I2C_BCLK 17
 #define I2C_LRC 18

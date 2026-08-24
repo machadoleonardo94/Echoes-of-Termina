@@ -79,8 +79,6 @@ bool setup_WIFI(bool portal_enabled)
 
     WiFi.mode(WIFI_AP_STA);
 
-    setup_OTA();
-
     { // Scoped block so WiFiManager is destroyed before we start our own web server
         WiFiManager wifiManager;
 
@@ -95,11 +93,12 @@ bool setup_WIFI(bool portal_enabled)
 
         wifiManager.setConfigPortalTimeout(portal_enabled ? 60 : 1);
 
-        String hostname = "Echoes of Termina";
+        // STA hostname (appears in the router's DHCP client list). Keep it
+        // DNS-clean — no spaces — so it also shows up correctly on the network.
+        wifiManager.setHostname("echoes");
 
-        wifiManager.setHostname(hostname);
-
-        if (!wifiManager.autoConnect(hostname.c_str()))
+        // Config-portal AP name shown when the device needs initial WiFi setup.
+        if (!wifiManager.autoConnect("Echoes of Termina"))
         {
             Serial.println("Failed to connect and hit timeout");
             connected = false;

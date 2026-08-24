@@ -1,0 +1,9 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# Single factory app (no OTA) on a 4MB flash. No SPIFFS/LittleFS: the web UI is an
+# embedded string and WiFi credentials persist in NVS, so no filesystem partition is
+# needed. A small coredump partition is kept for crash diagnostics.
+# For a future 8MB-flash hardware revision, restore dual-slot OTA (ota_0 + ota_1)
+# with a larger table to re-enable over-the-air updates.
+nvs,      data, nvs,     0x9000,  0x5000,
+app0,     app,  factory, 0x10000, 0x3E0000,
+coredump, data, coredump,0x3F0000,0x10000,

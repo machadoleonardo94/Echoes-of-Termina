@@ -50,6 +50,8 @@ class MetadataDialog(QDialog):
         self.setWindowTitle("Script Properties")
         self.setMinimumWidth(500)
         self.setStyleSheet("background: #1e1e1e;")
+        # Keep unknown/auto-managed keys (e.g. 'audio') across edits
+        self._orig = dict(meta)
 
         form = QFormLayout()
         form.setSpacing(8)
@@ -173,7 +175,8 @@ class MetadataDialog(QDialog):
 
     def get_meta(self) -> dict:
         """Return the (possibly edited) metadata as a plain dict of strings."""
-        return {
+        out = dict(self._orig)
+        out.update({
             'title':    self._title.text().strip(),
             'author':   self._author.text().strip(),
             'charter':  self._charter.text().strip(),
@@ -188,4 +191,5 @@ class MetadataDialog(QDialog):
             'duration': self._duration.text().strip(),
             'modified': self._modified.text().strip(),
             'comment':  self._comment.toPlainText().strip(),
-        }
+        })
+        return out

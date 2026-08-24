@@ -3,7 +3,7 @@
 
 //? ------------------------------------------------------------------------------------------
 //*! INMP441 microphone recording via I2S_NUM_1.
-//*! btAudio occupies I2S_NUM_0 for speaker output; this peripheral is fully independent.
+//*! The A2DP sink occupies I2S_NUM_0 for speaker output; this peripheral is fully independent.
 //*!
 //*! Wiring:
 //*!   INMP441 VDD  → 3.3V
@@ -17,7 +17,7 @@
 #include "shared/dependencies.h"
 #include <driver/i2s.h>
 
-//* I2S_NUM_1 — kept separate from btAudio which uses I2S_NUM_0
+//* I2S_NUM_1 — kept separate from the A2DP sink, which uses I2S_NUM_0
 #define MIC_I2S_PORT    I2S_NUM_1
 #define MIC_SAMPLE_RATE 16000
 #define MIC_DMA_BUFFERS 8

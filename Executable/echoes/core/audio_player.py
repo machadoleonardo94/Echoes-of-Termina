@@ -37,6 +37,14 @@ class AudioPlayer(QObject):
     def load(self, path: str) -> None:
         self._player.setSource(QUrl.fromLocalFile(path))
 
+    def load_url(self, url: str) -> None:
+        """Load a remote stream (e.g. audio served by the device portal)."""
+        self._player.setSource(QUrl(url))
+
+    def unload(self) -> None:
+        """Clear the current source (no audio loaded)."""
+        self._player.setSource(QUrl())
+
     def play(self)  -> None: self._player.play()
     def pause(self) -> None: self._player.pause()
     def stop(self)  -> None: self._player.stop()
@@ -65,6 +73,11 @@ class AudioPlayer(QObject):
     @property
     def has_source(self) -> bool:
         return self._player.source().isValid()
+
+    @property
+    def source_path(self) -> str:
+        """Local filesystem path of the loaded source ('' for non-file URLs)."""
+        return self._player.source().toLocalFile() or ""
 
     # ── Private ───────────────────────────────────────────────────────────────
 

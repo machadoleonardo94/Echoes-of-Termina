@@ -2,23 +2,25 @@
 #define SERVICE_LIGHTSHOW
 
 //? ------------------------------------------------------------------------------------------
-//*! Wellerman lightshow engine
-//*  Parses and plays back timed LED instruction files stored on LittleFS.
+//*! Echoes lightshow engine — plays .echoes files synced to the audio playhead.
 //*
-//*  File format (one instruction per line):
-//*    M:SS.mmm  SET  R G B        addr,addr,...
-//*    M:SS.mmm  FADE R G B fade%  addr,addr,...
+//*  File format (one command per line), matching the Echoes editor
+//*  (Executable/echoes/core/script_engine.py):
+//*    M:SS[.mmm]  SET  R G B                  LED-SPEC
+//*    M:SS[.mmm]  RAMP DURATION R0 G0 B0 R1 G1 B1  LED-SPEC
+//*    M:SS[.mmm]  FADE R G B PERCENT           LED-SPEC
 //*
-//*  SET  : turns LED(s) on at the given color, no decay (hodl = 1.0)
-//*  FADE : turns LED(s) on at the given color with exponential decay.
-//*         fade% is the percentage of brightness lost per second.
-//*         e.g. FADE 255 0 0 80  -> red decays to 20% after 1 second.
+//*  LED-SPEC: single "5", range "1-5", list "1,3,5", or wildcard "*".
+//*  Track headers ([Name]) and metadata (# @key value) lines are ignored;
+//*  commands from all tracks are merged in file order.
 //*
-//*  Addresses are 1-indexed in the file (matching the physical label),
-//*  converted to 0-indexed internally.
+//*  Memory: commands are STREAMED from the SD card as the playhead advances
+//*  (the ESP32 has too little RAM to hold a full show alongside the audio
+//*  decoder + WiFi). Only one command lives in RAM at a time.
 //*
-//*  Timing: WS2812B @ 800 kHz, 28 LEDs = 840 µs data + 300 µs reset ≈ 1.15 ms.
-//*  Timestep is set to 5 ms (200 fps) for comfortable real-time margin.
+//*  Timing: the engine follows an EXTERNAL playhead fed by the audio player
+//*  (lightshow_set_playhead_ms) so the show stays locked to the song — pause
+//*  freezes it, stop clears it, seeks re-sync it.
 //? ------------------------------------------------------------------------------------------
 
 #include "shared/dependencies.h"
@@ -27,12 +29,13 @@
 // Configuration
 // ---------------------------------------------------------------------------
 
-#define LIGHTSHOW_TIMESTEP_MS 5 // Frame period in ms (must be > ~1.15 ms for 28 LEDs)
-#define MAX_INSTRUCTIONS 1024   // Max instructions loaded into RAM (~20 KB)
-#define MAX_ADDR_PER_INSTR 8    // Max LED addresses per single instruction line
+#define LIGHTSHOW_TIMESTEP_MS 5  // frame period (must be > ~1.15 ms for 28 LEDs)
+#define MAX_ADDR_PER_INSTR 8     // explicit addresses per line (wildcard uses the all flag)
+#define LIGHTSHOW_LINE_LEN 160   // max parsed line length (long lines are truncated)
 
 #define INSTR_SET 0
 #define INSTR_FADE 1
+#define INSTR_RAMP 2
 
 // ---------------------------------------------------------------------------
 // Data structures
@@ -40,30 +43,38 @@
 
 typedef struct
 {
-    uint32_t time_ms;                 // Absolute playback time in ms
-    uint8_t type;                     // INSTR_SET or INSTR_FADE
-    uint8_t r, g, b;                  // Target color
-    uint8_t fade;                     // Decay rate % per second (FADE only)
+    uint32_t time_ms;                 // absolute playback time in ms
+    uint8_t type;                     // INSTR_SET / INSTR_FADE / INSTR_RAMP
+    uint8_t r, g, b;                  // SET / FADE target colour
+    uint8_t fade;                     // FADE decay % per second
+    uint8_t r0, g0, b0, r1, g1, b1;   // RAMP start / end colours
+    uint32_t dur_ms;                  // RAMP duration
+    bool all;                         // wildcard: apply to every LED
     uint8_t addr[MAX_ADDR_PER_INSTR]; // 0-indexed LED addresses
     uint8_t addr_count;
 } lightshow_instr_t;
 
 typedef struct
 {
-    float red = 0.0f;
-    float green = 0.0f;
-    float blue = 0.0f;
-    float hodl = 1.0f; // Per-frame brightness retention factor (0.0 – 1.0)
+    float red = 0.0f, green = 0.0f, blue = 0.0f;
+    float hodl = 1.0f;                     // per-frame retention (SET = 1.0)
+    bool  ramp_active = false;
+    float ramp_r0 = 0.0f, ramp_g0 = 0.0f, ramp_b0 = 0.0f;
+    float ramp_r1 = 0.0f, ramp_g1 = 0.0f, ramp_b1 = 0.0f;
+    uint32_t ramp_start_ms = 0, ramp_end_ms = 0;
 } wellerman_pixel_t;
 
 // ---------------------------------------------------------------------------
 // State (file-scoped)
 // ---------------------------------------------------------------------------
 
-static lightshow_instr_t show_instructions[MAX_INSTRUCTIONS];
-static uint16_t show_instruction_count = 0;
-static uint16_t show_current_index = 0;
-static uint32_t show_start_ms = 0;
+static File show_file;                     // open .echoes file (streamed)
+static lightshow_instr_t show_next;        // the next not-yet-fired command
+static bool show_has_next = false;
+static uint32_t show_fired_count = 0;      // commands fired so far (diagnostics)
+static uint16_t show_current_index = 0;    // placeholder kept for API symmetry
+static uint32_t show_playhead_ms = 0;
+static uint32_t show_last_pos_ms = 0;
 static bool show_playing = false;
 static wellerman_pixel_t w_pixels[MAJORA_LEDS];
 
@@ -71,7 +82,24 @@ static wellerman_pixel_t w_pixels[MAJORA_LEDS];
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-// Parses "M:SS.mmm" into milliseconds
+// Reads one text line (no trailing CR/LF) into *buf* without heap allocation.
+// Returns true if a line (possibly empty) was read.
+static bool _lightshow_read_line(char *buf, size_t buflen)
+{
+    size_t i = 0;
+    while (show_file.available() && i < buflen - 1)
+    {
+        int c = show_file.read();
+        if (c == '\n')
+            break;
+        if (c != '\r')
+            buf[i++] = (char)c;
+    }
+    buf[i] = '\0';
+    return i > 0 || show_file.available();
+}
+
+// Parses "M:SS[.mmm]" into milliseconds
 static uint32_t _lightshow_parse_time_ms(const char *s)
 {
     char *end;
@@ -100,13 +128,21 @@ static uint32_t _lightshow_parse_time_ms(const char *s)
     return min * 60000UL + sec * 1000UL + ms;
 }
 
-// Parses address tokens into a 0-indexed address array; returns count.
-// Supports comma-separated values ("3,12") and inclusive dash ranges ("7-8").
-// Both notations may be mixed: "3,7-9,12"
-static uint8_t _lightshow_parse_addrs(const char *addr_str, uint8_t *out)
+// Parses an LED-SPEC token into 0-indexed addresses; returns the count.
+// Supports comma-separated values ("3,12"), inclusive dash ranges ("7-8"),
+// mixed forms ("3,7-9,12") and the wildcard "*" (sets out->all).
+static uint8_t _lightshow_parse_addrs(const char *addr_str, lightshow_instr_t *out)
 {
+    if (strcmp(addr_str, "*") == 0)
+    {
+        out->all = true;
+        out->addr_count = 0;
+        return 0;
+    }
+    out->all = false;
+
     uint8_t count = 0;
-    char buf[48];
+    char buf[64];
     strncpy(buf, addr_str, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
@@ -129,54 +165,44 @@ static uint8_t _lightshow_parse_addrs(const char *addr_str, uint8_t *out)
             {
                 int idx = i - 1; // 1-indexed -> 0-indexed
                 if (idx >= 0 && idx < MAJORA_LEDS)
-                    out[count++] = (uint8_t)idx;
+                    out->addr[count++] = (uint8_t)idx;
             }
         }
         else
         {
             int addr = atoi(tok) - 1; // 1-indexed file -> 0-indexed array
             if (addr >= 0 && addr < MAJORA_LEDS)
-                out[count++] = (uint8_t)addr;
+                out->addr[count++] = (uint8_t)addr;
         }
         tok = strtok(NULL, ",");
     }
+    out->addr_count = count;
     return count;
 }
 
 // Parses a single text line into a lightshow_instr_t.
-// Returns true if the line is a valid instruction.
+// Returns true if the line is a valid command.
 static bool _lightshow_parse_line(const char *line, lightshow_instr_t *out)
 {
-    char buf[128];
+    char buf[LIGHTSHOW_LINE_LEN];
     strncpy(buf, line, sizeof(buf) - 1);
     buf[sizeof(buf) - 1] = '\0';
 
-    // Strip trailing CR/LF
-    for (char *p = buf; *p; p++)
-        if (*p == '\r' || *p == '\n')
-        {
-            *p = '\0';
-            break;
-        }
-
-    // Skip blank lines and comments
+    // Skip blank lines, comments and track-section headers
     const char *p = buf;
     while (*p == ' ' || *p == '\t')
         p++;
-    if (*p == '\0' || *p == '#' || *p == '/' || *p == '-' || *p == '<' || *p == '*')
+    if (*p == '\0' || *p == '#' || *p == '/' || *p == '-' || *p == '<' ||
+        *p == '*' || *p == '[')
         return false;
 
-    // Make a mutable copy for strtok (p may point into buf already)
-    char work[128];
+    char work[LIGHTSHOW_LINE_LEN];
     strncpy(work, p, sizeof(work) - 1);
     work[sizeof(work) - 1] = '\0';
 
-    // Token: timestamp
     char *time_tok = strtok(work, " \t");
     if (!time_tok)
         return false;
-
-    // Token: instruction type
     char *type_tok = strtok(NULL, " \t");
     if (!type_tok)
         return false;
@@ -185,137 +211,238 @@ static bool _lightshow_parse_line(const char *line, lightshow_instr_t *out)
         out->type = INSTR_SET;
     else if (strcmp(type_tok, "FADE") == 0)
         out->type = INSTR_FADE;
+    else if (strcmp(type_tok, "RAMP") == 0)
+        out->type = INSTR_RAMP;
     else
         return false;
 
-    // Tokens: R G B
-    char *r_tok = strtok(NULL, " \t");
-    char *g_tok = strtok(NULL, " \t");
-    char *b_tok = strtok(NULL, " \t");
-    if (!r_tok || !g_tok || !b_tok)
-        return false;
-
-    out->r = (uint8_t)atoi(r_tok);
-    out->g = (uint8_t)atoi(g_tok);
-    out->b = (uint8_t)atoi(b_tok);
-
-    // For FADE, next token is the fade percentage; for SET it is the addresses
-    char *next_tok = strtok(NULL, " \t");
-    if (!next_tok)
-        return false;
-
-    if (out->type == INSTR_FADE)
+    if (out->type == INSTR_RAMP)
     {
-        out->fade = (uint8_t)atoi(next_tok);
-        next_tok = strtok(NULL, " \t");
+        // RAMP DURATION R0 G0 B0 R1 G1 B1 LED-SPEC
+        char *dur_tok = strtok(NULL, " \t");
+        char *r0 = strtok(NULL, " \t");
+        char *g0 = strtok(NULL, " \t");
+        char *b0 = strtok(NULL, " \t");
+        char *r1 = strtok(NULL, " \t");
+        char *g1 = strtok(NULL, " \t");
+        char *b1 = strtok(NULL, " \t");
+        char *addr_tok = strtok(NULL, " \t");
+        if (!dur_tok || !r0 || !g0 || !b0 || !r1 || !g1 || !b1 || !addr_tok)
+            return false;
+        out->dur_ms = _lightshow_parse_time_ms(dur_tok);
+        out->r0 = (uint8_t)atoi(r0);
+        out->g0 = (uint8_t)atoi(g0);
+        out->b0 = (uint8_t)atoi(b0);
+        out->r1 = (uint8_t)atoi(r1);
+        out->g1 = (uint8_t)atoi(g1);
+        out->b1 = (uint8_t)atoi(b1);
+        out->r = out->r0;
+        out->g = out->g0;
+        out->b = out->b0;
+        _lightshow_parse_addrs(addr_tok, out);
+    }
+    else
+    {
+        // SET R G B LED-SPEC   /   FADE R G B PERCENT LED-SPEC
+        char *r_tok = strtok(NULL, " \t");
+        char *g_tok = strtok(NULL, " \t");
+        char *b_tok = strtok(NULL, " \t");
+        if (!r_tok || !g_tok || !b_tok)
+            return false;
+        out->r = (uint8_t)atoi(r_tok);
+        out->g = (uint8_t)atoi(g_tok);
+        out->b = (uint8_t)atoi(b_tok);
+
+        char *next_tok = strtok(NULL, " \t");
         if (!next_tok)
             return false;
-    }
-    else
-    {
-        out->fade = 0;
+        if (out->type == INSTR_FADE)
+        {
+            out->fade = (uint8_t)atoi(next_tok);
+            next_tok = strtok(NULL, " \t");
+            if (!next_tok)
+                return false;
+        }
+        else
+        {
+            out->fade = 0;
+        }
+        _lightshow_parse_addrs(next_tok, out);
     }
 
-    // Token: addresses
-    out->addr_count = _lightshow_parse_addrs(next_tok, out->addr);
     out->time_ms = _lightshow_parse_time_ms(time_tok);
-
-    return out->addr_count > 0;
+    return out->all || out->addr_count > 0;
 }
 
-// Applies a single instruction to the w_pixels working buffer
-static void _lightshow_apply_instr(const lightshow_instr_t *instr)
+// Reads ahead to the next valid command; stores it in show_next.
+static void _lightshow_advance()
 {
-    float hodl;
-    if (instr->type == INSTR_SET)
+    char line[LIGHTSHOW_LINE_LEN];
+    while (_lightshow_read_line(line, sizeof(line)))
     {
-        hodl = 1.0f; // No decay
+        if (_lightshow_parse_line(line, &show_next))
+        {
+            show_has_next = true;
+            return;
+        }
     }
-    else
+    show_has_next = false;
+}
+
+// Rewinds the stream and primes show_next with the first command.
+static void _lightshow_rewind()
+{
+    show_file.seek(0);
+    show_fired_count = 0;
+    _lightshow_advance();
+}
+
+// Applies a single command to the w_pixels working buffer.
+// *scale* (0..1) dims SET/FADE colours — used when re-syncing a FADE that
+// started before the current playhead position.
+static void _lightshow_apply_instr(const lightshow_instr_t *instr, float scale = 1.0f)
+{
+    float hodl = 1.0f;
+    if (instr->type == INSTR_FADE)
     {
         // Exponential decay: per-second retention = (100 - fade%) / 100
-        // Per-frame retention  = retention_per_sec ^ (TIMESTEP_MS / 1000)
         float retention_per_sec = (100.0f - (float)instr->fade) / 100.0f;
         hodl = powf(retention_per_sec, LIGHTSHOW_TIMESTEP_MS / 1000.0f);
     }
 
-    for (uint8_t a = 0; a < instr->addr_count; a++)
+    uint8_t count = instr->all ? MAJORA_LEDS : instr->addr_count;
+    for (uint8_t a = 0; a < count; a++)
     {
-        uint8_t idx = instr->addr[a];
-        w_pixels[idx].red = (float)instr->r;
-        w_pixels[idx].green = (float)instr->g;
-        w_pixels[idx].blue = (float)instr->b;
-        w_pixels[idx].hodl = hodl;
+        uint8_t idx = instr->all ? a : instr->addr[a];
+        if (idx >= MAJORA_LEDS)
+            continue;
+        wellerman_pixel_t &px = w_pixels[idx];
+
+        if (instr->type == INSTR_RAMP)
+        {
+            px.red = instr->r0;
+            px.green = instr->g0;
+            px.blue = instr->b0;
+            px.ramp_r0 = instr->r0;
+            px.ramp_g0 = instr->g0;
+            px.ramp_b0 = instr->b0;
+            px.ramp_r1 = instr->r1;
+            px.ramp_g1 = instr->g1;
+            px.ramp_b1 = instr->b1;
+            px.ramp_start_ms = instr->time_ms;
+            px.ramp_end_ms = instr->time_ms + instr->dur_ms;
+            px.ramp_active = true;
+            px.hodl = 1.0f;
+        }
+        else
+        {
+            px.red = (float)instr->r * scale;
+            px.green = (float)instr->g * scale;
+            px.blue = (float)instr->b * scale;
+            px.hodl = hodl;
+            px.ramp_active = false;
+        }
     }
+}
+
+// Re-syncs the engine to an arbitrary playhead position (after a seek).
+// Rewinds the stream, re-applies every command that should be active, and
+// primes the next command after *ms*.
+static void _lightshow_resync(uint32_t ms)
+{
+    for (int i = 0; i < MAJORA_LEDS; i++)
+        w_pixels[i] = wellerman_pixel_t();
+
+    show_file.seek(0);
+    show_fired_count = 0;
+
+    char line[LIGHTSHOW_LINE_LEN];
+    while (_lightshow_read_line(line, sizeof(line)))
+    {
+        lightshow_instr_t ins;
+        if (!_lightshow_parse_line(line, &ins))
+            continue;
+        if (ins.time_ms > ms)
+        {
+            show_next = ins;
+            show_has_next = true;
+            return;
+        }
+        show_fired_count++;
+
+        if (ins.type == INSTR_FADE && ms > ins.time_ms)
+        {
+            // Approximate the decayed brightness at the current position
+            float retention_per_sec = (100.0f - (float)ins.fade) / 100.0f;
+            float k = powf(retention_per_sec, (float)(ms - ins.time_ms) / 1000.0f);
+            _lightshow_apply_instr(&ins, k);
+        }
+        else
+        {
+            _lightshow_apply_instr(&ins);
+        }
+    }
+    show_has_next = false;
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-// Loads a lightshow file from LittleFS into RAM.
-// Call once (or whenever the file changes) before start_lightshow().
-// Returns true if at least one instruction was loaded.
+// Opens a .echoes file on the SD card for streaming. Call once before
+// lightshow_play(). Returns true if at least one command was found.
 bool load_lightshow(const char *filepath)
 {
-    if (!LittleFS.begin(false))
+    if (!sdcard)
     {
-        Serial.println("[Lightshow] LittleFS mount failed");
+        Serial.println("[Lightshow] No SD card — cannot load lightshow");
         return false;
     }
+    if (show_file)
+        show_file.close();
 
-    File f = LittleFS.open(filepath, "r");
-    if (!f)
+    show_file = SD_MMC.open(filepath, "r");
+    if (!show_file)
     {
         Serial.printf("[Lightshow] Cannot open %s\n", filepath);
         return false;
     }
 
-    show_instruction_count = 0;
-
-    while (f.available() && show_instruction_count < MAX_INSTRUCTIONS)
-    {
-        String line = f.readStringUntil('\n');
-        lightshow_instr_t instr;
-        if (_lightshow_parse_line(line.c_str(), &instr))
-            show_instructions[show_instruction_count++] = instr;
-    }
-
-    f.close();
-    Serial.printf("[Lightshow] Loaded %u instructions from %s\n",
-                  show_instruction_count, filepath);
-    return show_instruction_count > 0;
+    _lightshow_rewind();
+    Serial.printf("[Lightshow] Streaming %s  (first command at %u ms, heap %u KB free)\n",
+                  filepath,
+                  show_has_next ? show_next.time_ms : 0,
+                  (unsigned)(esp_get_free_heap_size() / 1024));
+    return show_has_next;
 }
 
-// Starts playback from the beginning. Call after load_lightshow().
-void start_lightshow()
+// Starts playback, following the external playhead (audio position).
+void lightshow_play()
 {
     for (int i = 0; i < MAJORA_LEDS; i++)
-        w_pixels[i] = {0.0f, 0.0f, 0.0f, 1.0f};
-
-    // Sequential LED chase: lights each LED one by one so we can map
-    // which physical positions respond to which software indices.
-    // Eyes (0,1) should blink first, then spikes (2-11), then front (12-27).
-    for (int i = 0; i < MAJORA_LEDS; i++)
-    {
-        majora.setPixelColor(i, majora.Color(180, 180, 180));
-        majora.show();
-        delay(60);
-        majora.setPixelColor(i, 0);
-    }
-    majora.show();
-
+        w_pixels[i] = wellerman_pixel_t();
+    show_playhead_ms = 0;
+    show_last_pos_ms = 0;
+    show_fired_count = 0;
     show_current_index = 0;
-    show_start_ms = millis();
+    _lightshow_rewind();
     show_playing = true;
-    Serial.printf("[Lightshow] Playback started — first instruction at %u ms\n",
-                  show_instruction_count > 0 ? show_instructions[0].time_ms : 0);
+    Serial.printf("[Lightshow] Playback attached (first command at %u ms)\n",
+                  show_has_next ? show_next.time_ms : 0);
 }
 
-// Stops playback and clears the strip.
-void stop_lightshow()
+// Stops playback, closes the stream and clears the strip.
+void lightshow_stop()
 {
+    if (!show_playing && !show_file)
+        return;
     show_playing = false;
+    if (show_file)
+    {
+        show_file.close();
+        show_file = File();
+    }
+    show_has_next = false;
     for (int i = 0; i < MAJORA_LEDS; i++)
         majora.setPixelColor(i, 0);
     majora.show();
@@ -323,10 +450,23 @@ void stop_lightshow()
 }
 
 bool is_lightshow_playing() { return show_playing; }
-uint16_t lightshow_loaded_count() { return show_instruction_count; }
+uint16_t lightshow_loaded_count() { return show_fired_count; }
 
-// Frame update – call every loop iteration.
-// Fires due instructions, decays active pixels, and pushes to the majora strip.
+// Feeds the engine with the current audio position (ms).
+// Detects seeks and re-syncs the show when the playhead jumps.
+void lightshow_set_playhead_ms(uint32_t ms)
+{
+    if (!show_playing)
+        return;
+    // A backward move, or a forward jump beyond 150 ms, is a seek
+    if (ms + 150 < show_last_pos_ms || ms > show_last_pos_ms + 150)
+        _lightshow_resync(ms);
+    show_playhead_ms = ms;
+    show_last_pos_ms = ms;
+}
+
+// Frame update — call every loop iteration.
+// Fires due commands, advances ramps, decays fades, pushes to the strip.
 void run_lightshow()
 {
     if (!show_playing)
@@ -337,61 +477,66 @@ void run_lightshow()
         return;
     last_update = millis();
 
-    uint32_t elapsed = millis() - show_start_ms;
+    uint32_t elapsed = show_playhead_ms;
 
-    // Debug: print elapsed every second and dump first fired instruction
-    static uint32_t last_debug_sec = 0;
-    if (elapsed / 1000 != last_debug_sec)
+    // 1 Hz heartbeat — proves the engine is alive and shows where it is
+    static uint32_t last_beat = 0xFFFFFFFFUL;
+    if (elapsed / 1000 != last_beat)
     {
-        last_debug_sec = elapsed / 1000;
-        Serial.printf("[Lightshow] t=%u ms  idx=%u/%u  next_instr_t=%u ms\n",
-                      elapsed, show_current_index, show_instruction_count,
-                      show_current_index < show_instruction_count
-                          ? show_instructions[show_current_index].time_ms
-                          : 0);
+        last_beat = elapsed / 1000;
+        Serial.printf("[Lightshow] t=%u ms  fired=%u  next=%u ms\n",
+                      elapsed, show_fired_count,
+                      show_has_next ? show_next.time_ms : 0);
     }
 
-    // Fire all instructions whose timestamp has passed
-    while (show_current_index < show_instruction_count &&
-           show_instructions[show_current_index].time_ms <= elapsed)
+    // Fire all commands whose timestamp has passed (streamed from the SD)
+    while (show_has_next && show_next.time_ms <= elapsed)
     {
-        const lightshow_instr_t &ins = show_instructions[show_current_index];
-        Serial.printf("[Lightshow] FIRE t=%u %s rgb(%u,%u,%u) fade=%u addrs=",
-                      ins.time_ms, ins.type == INSTR_SET ? "SET" : "FADE",
-                      ins.r, ins.g, ins.b, ins.fade);
-        for (uint8_t a = 0; a < ins.addr_count; a++)
-            Serial.printf("%u ", ins.addr[a]);
-        Serial.println();
-        _lightshow_apply_instr(&show_instructions[show_current_index]);
+        _lightshow_apply_instr(&show_next);
+        show_fired_count++;
         show_current_index++;
+        _lightshow_advance();
     }
 
-    // Decay active pixels and update the strip
-    bool any_lit = false;
+    // Update pixels: lerp active ramps, decay fades, keep SETs
     for (int i = 0; i < MAJORA_LEDS; i++)
     {
-        if (w_pixels[i].red > 0.5f ||
-            w_pixels[i].green > 0.5f ||
-            w_pixels[i].blue > 0.5f)
+        wellerman_pixel_t &px = w_pixels[i];
+
+        if (px.ramp_active)
         {
-            w_pixels[i].red *= w_pixels[i].hodl;
-            w_pixels[i].green *= w_pixels[i].hodl;
-            w_pixels[i].blue *= w_pixels[i].hodl;
-            any_lit = true;
+            if (elapsed >= px.ramp_end_ms)
+            {
+                px.red = px.ramp_r1;
+                px.green = px.ramp_g1;
+                px.blue = px.ramp_b1;
+                px.ramp_active = false;
+                px.hodl = 1.0f;
+            }
+            else
+            {
+                float span = (float)(px.ramp_end_ms - px.ramp_start_ms);
+                float t = span > 0 ? (float)(elapsed - px.ramp_start_ms) / span : 1.0f;
+                if (t < 0.0f)
+                    t = 0.0f;
+                px.red = px.ramp_r0 + (px.ramp_r1 - px.ramp_r0) * t;
+                px.green = px.ramp_g0 + (px.ramp_g1 - px.ramp_g0) * t;
+                px.blue = px.ramp_b0 + (px.ramp_b1 - px.ramp_b0) * t;
+            }
         }
+        else if (px.red > 0.5f || px.green > 0.5f || px.blue > 0.5f)
+        {
+            px.red *= px.hodl;
+            px.green *= px.hodl;
+            px.blue *= px.hodl;
+        }
+
         majora.setPixelColor(i, majora.Color(
-                                    (uint8_t)w_pixels[i].red,
-                                    (uint8_t)w_pixels[i].green,
-                                    (uint8_t)w_pixels[i].blue));
+                                     (uint8_t)px.red,
+                                     (uint8_t)px.green,
+                                     (uint8_t)px.blue));
     }
     majora.show();
-
-    // Stop automatically once all instructions have fired and all LEDs have faded out
-    if (show_current_index >= show_instruction_count && !any_lit)
-    {
-        show_playing = false;
-        Serial.println("[Lightshow] Playback finished");
-    }
 }
 
 #endif // SERVICE_LIGHTSHOW

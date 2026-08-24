@@ -23,14 +23,23 @@ import os
 import re
 from typing import Optional
 
-from PySide6.QtCore    import Qt, QSize
+from PySide6.QtCore    import QObject, QSettings, Qt, QSize
 from PySide6.QtGui     import QAction, QCursor, QTextCursor
 from PySide6.QtWidgets import (
-    QCheckBox, QFileDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QSizePolicy, QSplitter, QToolBar, QVBoxLayout, QWidget,
+    QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSplitter,
+    QToolBar, QVBoxLayout, QWidget,
 )
 
+from core.audio_converter import (
+    Mp3ConvertWorker, ffmpeg_available, find_audio_files,
+)
 from core.audio_player  import AudioPlayer
+from core.device_discovery import DEFAULT_HOSTNAME, DeviceMonitor, probe_device
+from core.device_media import (
+    DeviceStatusPoller, ProjectUploadWorker, device_url, ensure_dir, fetch_dir,
+    fetch_text, pause_device, play_on_device,
+)
 from core.script_engine import ScriptEngine, format_ms, remap_hw_version, _parse_timestamp
 
 # Default project folder (tools/echoes/projects/)
@@ -95,6 +104,7 @@ def _parse_song_ini(path: str) -> dict:
 
 
 from ui.command_toolbox  import CommandToolbox
+from ui.device_browser_dialog import DeviceBrowserDialog
 from ui.led_canvas       import LEDCanvas
 from ui.metadata_dialog  import MetadataDialog
 from ui.note_highway     import NoteHighway
@@ -102,12 +112,45 @@ from ui.script_editor    import MultiTrackEditorWidget, ScriptEditor
 from ui.transport_bar    import TransportBar
 
 
+# ── Upload worker lifetime ────────────────────────────────────────────────────
+# A project upload may outlive the window (Wi-Fi transfer). Keep a strong
+# reference so the QThread is never destroyed while running, and reap it on
+# the main thread once it finishes.
+
+_upload_workers: list = []
+
+
+class _UploadReaper(QObject):
+    """Lives in the main thread; safely deleteLater()-s finished uploaders."""
+
+    def reap(self, worker=None) -> None:
+        worker = worker if worker is not None else self.sender()
+        if worker in _upload_workers:
+            _upload_workers.remove(worker)
+        worker.deleteLater()
+
+
+_upload_reaper = _UploadReaper()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Echoes")
-        self.resize(1440, 780)
+        # Default size that fits the screen: 1440x780 on large displays,
+        # smaller (but never below the minimum) on compact laptops.
+        from PySide6.QtWidgets import QApplication
+        screen = QApplication.primaryScreen()
+        avail  = screen.availableGeometry() if screen else None
+        width  = min(1440, avail.width() - 80)  if avail else 1440
+        height = min(780,  avail.height() - 80) if avail else 780
+        self.resize(max(900, width), max(560, height))
         self.setMinimumSize(900, 560)
+
+        # Restore the user's window size / position when available
+        saved = QSettings().value("window/geometry")
+        if saved:
+            self.restoreGeometry(saved)
 
         self._audio  = AudioPlayer(self)
         self._engines: dict[str, ScriptEngine] = {}   # one engine per track slot
@@ -116,10 +159,28 @@ class MainWindow(QMainWindow):
         self._last_script_dir: str = _PROJECTS
         self._meta: dict = {}   # metadata parsed from / written to the .echoes header
 
+        self._mp3_actions: list[QAction] = []   # toolbar + menu actions (disabled while converting)
+        self._mp3_worker: Optional[Mp3ConvertWorker] = None
+        self._audio_files: list = []            # multi-track stems (session state)
+
+        # Device (hardware) discovery state
+        self._device_monitor: Optional[DeviceMonitor] = None
+        self._device_paired  = False
+        self._device_online  = False
+        self._device_info: Optional[dict] = None
+        self._device_browser: Optional["DeviceBrowserDialog"] = None
+        self._device_status: Optional[dict] = None       # latest /api/status
+        self._status_poller: Optional[DeviceStatusPoller] = None
+        self._upload_worker: Optional[ProjectUploadWorker] = None
+        self._upload_dialog = None
+        self._device_project_folder: Optional[str] = None
+
         self._build_central()
         self._build_toolbar()
+        self._build_device_toolbar()
         self._build_menu()
         self._wire()
+        self._set_track_display("No file loaded")
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -171,7 +232,51 @@ class MainWindow(QMainWindow):
         hsplit.addWidget(self._highway)
 
         self._canvas = LEDCanvas()
-        hsplit.addWidget(self._canvas)
+
+        # Canvas settings strip — BG / Labels / HW V2 live on the mask area
+        # itself, so they are always visible (never hidden in a menu).
+        canvas_wrap = QWidget()
+        cw = QVBoxLayout(canvas_wrap)
+        cw.setContentsMargins(0, 0, 0, 0)
+        cw.setSpacing(0)
+
+        strip = QWidget()
+        strip.setFixedHeight(26)
+        strip.setStyleSheet(
+            "background:#2a2a2a; border-bottom:1px solid #333333;")
+        sh = QHBoxLayout(strip)
+        sh.setContentsMargins(8, 0, 8, 0)
+        sh.setSpacing(12)
+
+        _check_style = "color:#aaaaaa; font:11px 'Segoe UI';"
+        self._bg_check = QCheckBox("BG", strip)
+        self._bg_check.setChecked(True)
+        self._bg_check.setToolTip("Show / hide the background image")
+        self._bg_check.setStyleSheet(_check_style)
+        self._bg_check.toggled.connect(self._canvas.set_bg_visible)
+
+        self._lbl_check = QCheckBox("Labels", strip)
+        self._lbl_check.setChecked(True)
+        self._lbl_check.setToolTip("Show / hide zone number labels")
+        self._lbl_check.setStyleSheet(_check_style)
+        self._lbl_check.toggled.connect(self._canvas.set_labels_visible)
+
+        self._v2_check = QCheckBox("HW V2", strip)
+        self._v2_check.setChecked(False)
+        self._v2_check.setToolTip(
+            "V1: eyes at LEDs 27-28 (default)\n"
+            "V2: eyes at LEDs 1-2")
+        self._v2_check.setStyleSheet(_check_style)
+        self._v2_check.toggled.connect(self._canvas.set_hw_version)
+
+        sh.addWidget(self._bg_check)
+        sh.addWidget(self._lbl_check)
+        sh.addWidget(self._v2_check)
+        sh.addStretch(1)
+
+        cw.addWidget(strip)
+        cw.addWidget(self._canvas, stretch=1)
+        hsplit.addWidget(canvas_wrap)
 
         hsplit.setSizes([340, 540])
         rv.addWidget(hsplit, stretch=1)
@@ -241,63 +346,117 @@ class MainWindow(QMainWindow):
         act_tracks.triggered.connect(self._import_tracks)
         tb.addAction(act_tracks)
 
-        tb.addSeparator()
+        act_mp3_convert = QAction(
+            style.standardIcon(SP.SP_MediaSeekForward), "  Convert to .MP3", self)
+        act_mp3_convert.setToolTip(
+            "Convert the loaded audio to .MP3 next to the source file\n"
+            "so the firmware's SD card player can use it (needs ffmpeg)")
+        act_mp3_convert.triggered.connect(self._convert_to_mp3)
+        tb.addAction(act_mp3_convert)
+        self._mp3_actions.append(act_mp3_convert)
 
-        act_convert = QAction(
-            style.standardIcon(SP.SP_BrowserReload), "  Convert HW", self)
-        act_convert.setToolTip(
-            "Remap LED addresses between V1 and V2 hardware\n"
-            "V1: eyes at LEDs 27-28 | V2: eyes at LEDs 1-2")
-        act_convert.triggered.connect(self._convert_hw_version)
-        tb.addAction(act_convert)
-
-        # Expanding spacer so the filename label is pushed to the right
+        # Expanding spacer so the right-side cluster stays pinned to the right
         spacer = QWidget()
         spacer.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         tb.addWidget(spacer)
 
-        # Background image toggle
-        self._bg_check = QCheckBox("BG", self)
-        self._bg_check.setChecked(True)
-        self._bg_check.setToolTip("Show / hide the background image")
-        self._bg_check.setStyleSheet(
-            "color:#aaaaaa; font:11px 'Segoe UI'; padding-right:6px;")
-        self._bg_check.toggled.connect(
-            lambda on: self._canvas.set_bg_visible(on))
-        tb.addWidget(self._bg_check)
+        # ── Device status: hardware discovery / pairing ─────────────────────
+        tb.addSeparator()
 
-        # Zone label toggle
-        self._lbl_check = QCheckBox("Labels", self)
-        self._lbl_check.setChecked(True)
-        self._lbl_check.setToolTip("Show / hide zone number labels")
-        self._lbl_check.setStyleSheet(
-            "color:#aaaaaa; font:11px 'Segoe UI'; padding-right:6px;")
-        self._lbl_check.toggled.connect(
-            lambda on: self._canvas.set_labels_visible(on))
-        tb.addWidget(self._lbl_check)
+        self._device_dot = QLabel()
+        self._device_dot.setFixedSize(12, 12)
+        self._device_dot.setStyleSheet("background:#d33; border-radius:6px;")
+        self._device_dot.setToolTip("Device not found")
+        tb.addWidget(self._device_dot)
 
-        # Hardware version toggle
-        self._v2_check = QCheckBox("HW V2", self)
-        self._v2_check.setChecked(False)
-        self._v2_check.setToolTip(
-            "V1: eyes at LEDs 27-28 (default)\n"
-            "V2: eyes at LEDs 1-2")
-        self._v2_check.setStyleSheet(
-            "color:#aaaaaa; font:11px 'Segoe UI'; padding-right:6px;")
-        self._v2_check.toggled.connect(
-            lambda v2: self._canvas.set_hw_version(v2))
-        tb.addWidget(self._v2_check)
+        self._device_label = QLabel(f"{DEFAULT_HOSTNAME} \u2014 not found")
+        self._device_label.setStyleSheet(
+            "color:#888888; font:11px 'Segoe UI'; padding:0 4px;")
+        tb.addWidget(self._device_label)
+
+        self._device_btn = QPushButton("Connect")
+        self._device_btn.setEnabled(False)
+        self._device_btn.setToolTip(
+            "Find the Echoes hardware on the network and pair with it")
+        self._device_btn.clicked.connect(self._toggle_device_pair)
+        tb.addWidget(self._device_btn)
+
+        self._device_media_btn = QPushButton("Device Media")
+        self._device_media_btn.setEnabled(False)
+        self._device_media_btn.setToolTip(
+            "Browse the music albums and lightshow projects stored on the device")
+        self._device_media_btn.clicked.connect(self._open_device_browser)
+        tb.addWidget(self._device_media_btn)
 
         self._info_bar = QLabel("No file loaded")
         self._info_bar.setStyleSheet(
             "color:#888888; font:11px 'Segoe UI'; padding-right:8px;")
         tb.addWidget(self._info_bar)
 
+    def _build_device_toolbar(self) -> None:
+        """Second toolbar: live playback control for the paired hardware."""
+        # The main toolbar is very wide; give the device toolbar its own row
+        # so its widgets are never clipped off the right edge.
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+
+        tb = QToolBar("Device", self)
+        tb.setMovable(False)
+        tb.setFloatable(False)
+        self._device_toolbar = tb
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, tb)
+
+        style = self.style()
+        SP    = style.StandardPixmap
+
+        self._device_play_btn = QAction(
+            style.standardIcon(SP.SP_MediaPlay), "  Play", self)
+        self._device_play_btn.setToolTip(
+            "Resume / play the current track on the device")
+        self._device_play_btn.setEnabled(False)
+        self._device_play_btn.triggered.connect(self._device_play)
+        tb.addAction(self._device_play_btn)
+
+        self._device_pause_btn = QAction(
+            style.standardIcon(SP.SP_MediaPause), "  Pause", self)
+        self._device_pause_btn.setToolTip("Pause playback on the device")
+        self._device_pause_btn.setEnabled(False)
+        self._device_pause_btn.triggered.connect(self._device_pause)
+        tb.addAction(self._device_pause_btn)
+
+        self._device_progress = QProgressBar()
+        self._device_progress.setFixedWidth(170)
+        self._device_progress.setTextVisible(True)
+        self._device_progress.setFormat("%v / %m s")
+        self._device_progress.setRange(0, 0)
+        self._device_progress.setToolTip(
+            "Playback position on the device (updates every second)")
+        tb.addWidget(self._device_progress)
+
+        spacer = QWidget()
+        spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
+
+        self._device_upload_btn = QPushButton("Upload Project")
+        self._device_upload_btn.setToolTip(
+            "Upload this project's .mp3 and .echoes to\n"
+            "/Echoes/Lightshows/<project name> on the device")
+        self._device_upload_btn.clicked.connect(self._device_upload_project)
+        tb.addWidget(self._device_upload_btn)
+
+        tb.setVisible(False)
+
     def _build_menu(self) -> None:
         mb = self.menuBar()
         fm = mb.addMenu("&File")
+        self._act(fm, "&New Project",              "Ctrl+N",        self._new_project)
+        fm.addSeparator()
         self._act(fm, "&Open Audio\u2026",         "Ctrl+O",        self._open_mp3)
+        self._act(fm, "Load Audio &Tracks\u2026", "Ctrl+Alt+O",    self._open_audio_tracks)
+        self._mp3_actions.append(self._act(
+            fm, "Convert Audio to .&MP3\u2026", "", self._convert_to_mp3))
+        self._act(fm, "Upload to &Device\u2026", "", self._device_upload_project)
         fm.addSeparator()
         self._act(fm, "Open &Project\u2026",      "Ctrl+Shift+O",  self._open_script)
         self._act(fm, "&Save Script",             "Ctrl+S",        self._save_script)
@@ -308,11 +467,17 @@ class MainWindow(QMainWindow):
         fm.addSeparator()
         self._act(fm, "&Quit",                    "Ctrl+Q",        self.close)
 
-    def _act(self, menu, label: str, shortcut: str, slot) -> None:
+        # ── Tools: less-frequent utilities live here, not the toolbar ───────
+        tm = mb.addMenu("&Tools")
+        self._act(tm, "&Convert Hardware Version\u2026", "", self._convert_hw_version)
+
+    def _act(self, menu, label: str, shortcut: str, slot) -> QAction:
         a = QAction(label, self)
-        a.setShortcut(shortcut)
+        if shortcut:
+            a.setShortcut(shortcut)
         a.triggered.connect(slot)
         menu.addAction(a)
+        return a
 
     # ── Signal wiring ─────────────────────────────────────────────────────────
 
@@ -331,7 +496,478 @@ class MainWindow(QMainWindow):
             lambda bpm: self._highway.set_beat_ms(round(60_000 / bpm)))
         self._highway.set_beat_ms(round(60_000 / self._transport._bpm.value()))
 
+        # ── Hardware discovery (background poll of echoes.local) ─────────────
+        self._device_monitor = DeviceMonitor(DEFAULT_HOSTNAME, parent=self)
+        self._device_monitor.state_changed.connect(self._on_device_state)
+        self._device_monitor.start()
+
+    # ── Device discovery / pairing ────────────────────────────────────────────
+
+    def _on_device_state(self, info: Optional[dict]) -> None:
+        """Monitor tick: *info* is the discovery result, or None when offline."""
+        self._device_online = info is not None
+        self._device_info   = info
+        self._update_device_ui()
+
+    def _toggle_device_pair(self) -> None:
+        """Connect ⇄ Disconnect button — pair with / unpair from the device."""
+        if self._device_paired:
+            self._device_paired = False
+            self.statusBar().showMessage("Device disconnected")
+        else:
+            if self._device_info is None:
+                QMessageBox.warning(
+                    self, "Device not found",
+                    f"No Echoes hardware found on the network ({DEFAULT_HOSTNAME}).\n"
+                    "Make sure the device is powered on and on the same Wi-Fi network.",
+                )
+                return
+            # Live re-verify so a stale monitor result can't fake a pairing
+            host = self._device_info.get("host") or self._device_info.get("ip")
+            if probe_device(host) is None:
+                QMessageBox.warning(
+                    self, "Device offline",
+                    f"{DEFAULT_HOSTNAME} stopped responding.\n"
+                    "Check the device power and network, then try again.",
+                )
+                return
+            self._device_paired = True
+            self.statusBar().showMessage(
+                f"Paired with Echoes hardware at "
+                f"{self._device_info.get('ip', '')}  \u2014  "
+                f"SD: {'yes' if self._device_info['status'].get('sd') else 'no'}")
+        self._update_device_ui()
+        if self._device_paired:
+            self._open_device_browser()
+
+    def _device_host(self) -> str:
+        """Best host string for device HTTP calls (IP preferred over mDNS)."""
+        if self._device_info is not None:
+            return (self._device_info.get("ip")
+                    or self._device_info.get("host") or DEFAULT_HOSTNAME)
+        return DEFAULT_HOSTNAME
+
+    def _open_device_browser(self) -> None:
+        """Open (or refresh) the device media browser dialog."""
+        if not self._device_paired:
+            QMessageBox.information(
+                self, "Not connected",
+                "Pair with the device first (Connect button), then browse its media.")
+            return
+        if self._device_browser is None:
+            self._device_browser = DeviceBrowserDialog(self._device_host(), self)
+            self._device_browser.load_project_requested.connect(
+                self._device_load_project)
+            self._device_browser.play_requested.connect(self._device_play_path)
+            self._device_browser.destroyed.connect(
+                lambda: setattr(self, "_device_browser", None))
+        else:
+            self._device_browser.set_host(self._device_host())
+            self._device_browser.refresh()
+        self._device_browser.show()
+        self._device_browser.raise_()
+        self._device_browser.activateWindow()
+
+    def _device_play_path(self, file_path: str) -> None:
+        """Play a stored audio file on the device (browser Play action). A
+        Lightshows project also starts its synced .echoes lightshow."""
+        ok, msg = play_on_device(self._device_host(), file_path)
+        if ok:
+            if "/Echoes/Lightshows/" in file_path.replace("\\", "/"):
+                msg = f"{msg}  \u2014  lightshow attached"
+            self.statusBar().showMessage(f"Device play: {msg}")
+        else:
+            self.statusBar().showMessage(f"Device play failed: {msg}")
+        if ok:
+            self._set_track_display(
+                f"  \u25b6  {os.path.basename(file_path)}  (device)")
+
+    def _device_load_project(self, project: dict) -> None:
+        """Load a stored project (echoes script + audio) from the device."""
+        host = self._device_host()
+        # Device paths always use forward slashes
+        script_name = project["script"][0]
+        script_path = project["path"] + "/" + script_name
+        text = fetch_text(host, script_path)
+        if text is None:
+            QMessageBox.warning(
+                self, "Load failed",
+                f"Could not download {script_path} from the device.")
+            return
+        self._apply_script_text(text, title=f"{project['name']}  (device)")
+        self.statusBar().showMessage(
+            f"Loaded project \u201c{project['name']}\u201d from device \u2014 "
+            f"audio: {project['audio'][0]}")
+
+        audio_path = project["path"] + "/" + project["audio"][0]
+        self._audio.load_url(device_url(host, audio_path))
+        self._set_track_display(
+            f"  \u266b  {project['audio'][0]}  \u2014  {host}")
+
+    def _update_device_ui(self) -> None:
+        """Refresh the dot, label and Connect button from current state."""
+        info   = self._device_info
+        online = self._device_online
+        paired = self._device_paired
+
+        if info is not None:
+            st = info.get("status") or {}
+            via = {"mDNS": "mDNS (echoes.local)",
+                   "ip-cache": "cached IP",
+                   "subnet": "subnet scan"}.get(info.get("via"), info.get("via", ""))
+            heap = st.get('heap')
+            heap_txt = f"{heap // 1024} KB" if isinstance(heap, (int, float)) else '—'
+            self._device_label.setText(f"{DEFAULT_HOSTNAME}  \u2022  {info.get('ip', '')}")
+            self._device_label.setToolTip(
+                f"Found via {via}\n"
+                f"SD card: {'present' if st.get('sd') else 'missing'}\n"
+                f"Playing: {'yes' if st.get('playing') else 'no'}\n"
+                f"Lightshow: {'attached' if st.get('show') else 'off'}\n"
+                f"Free heap: {heap_txt}\n"
+                f"Track:   {st.get('track') or '—'}\n"
+                f"Volume:  {st.get('volume', '—')}")
+        else:
+            self._device_label.setText(f"{DEFAULT_HOSTNAME} \u2014 not found")
+            self._device_label.setToolTip(
+                "Device not reachable on the network\n"
+                "(powers on, same Wi-Fi network, mDNS/subnet scan active)")
+
+        if paired:
+            self._device_btn.setText("Disconnect")
+            self._device_btn.setEnabled(True)
+            color   = "#4caf50" if online else "#d33"
+            dot_tip = "Paired \u2014 device online" if online else "Paired \u2014 device offline"
+        else:
+            self._device_btn.setText("Connect")
+            self._device_btn.setEnabled(online)
+            color   = "#d33"
+            dot_tip = ("Device found \u2014 click Connect to pair"
+                       if online else "Device not found")
+
+        self._device_dot.setStyleSheet(f"background:{color}; border-radius:6px;")
+        self._device_dot.setToolTip(dot_tip)
+        self._device_media_btn.setEnabled(paired)
+
+        # ── Device transport toolbar + status poller ─────────────────────────
+        self._device_toolbar.setVisible(paired)
+        if paired and self._status_poller is None:
+            self._status_poller = DeviceStatusPoller(
+                self._device_host(), parent=self)
+            self._status_poller.status_changed.connect(self._on_device_status)
+            self._status_poller.start()
+        elif not paired and self._status_poller is not None:
+            self._stop_status_poller()
+        self._update_device_buttons()
+
+    # ── Device transport control ──────────────────────────────────────────────
+
+    def _stop_status_poller(self) -> None:
+        poller = self._status_poller
+        self._status_poller = None
+        self._device_status = None
+        if poller is not None:
+            poller.stop()
+            poller.wait(4000)          # probe timeout is 2 s — give it room
+            poller.deleteLater()
+
+    def _on_device_status(self, status: Optional[dict]) -> None:
+        """1s poll tick from the device — refresh transport controls."""
+        self._device_status = status
+        self._update_device_buttons()
+
+    def _update_device_buttons(self) -> None:
+        st = self._device_status or {}
+        playing = bool(st.get("playing"))
+        track   = (st.get("track") or "").strip()
+        dur = int(st.get("dur") or 0)
+        pos = int(st.get("pos") or 0)
+
+        self._device_pause_btn.setEnabled(playing)
+        self._device_play_btn.setEnabled(
+            not playing and
+            (bool(track) or self._device_project_audio_path() is not None))
+        if dur > 0:
+            self._device_progress.setRange(0, dur)
+            self._device_progress.setValue(max(0, min(pos, dur)))
+        else:
+            self._device_progress.setRange(0, 0)
+            self._device_progress.setValue(0)
+
+    def _device_project_audio_path(self) -> Optional[str]:
+        """Device path of this project's audio (Lightshows/<proj>/<audio>), if known."""
+        if not self._script_path:
+            return None
+        audio = self._meta.get('audio', '').strip()
+        if not audio:
+            src = self._audio.source_path
+            if src and os.path.isfile(src):
+                audio = os.path.basename(src)
+            else:
+                return None
+        folder = self._device_project_folder
+        if not folder:
+            stem = os.path.splitext(os.path.basename(self._script_path))[0]
+            folder = f"/Echoes/Lightshows/{stem}"
+        return f"{folder}/{audio}"
+
+    def _device_play(self) -> None:
+        """Resume the current track, or start the project's audio on the device."""
+        host = self._device_host()
+        st = self._device_status or {}
+        if st.get("playing"):
+            return
+        track = (st.get("track") or "").strip()
+        if track:
+            ok, msg = pause_device(host, "resume")
+            if not ok:
+                self.statusBar().showMessage(f"Device resume failed: {msg}")
+                return
+            # resume may not restart a finished song — fall back to replaying it
+            st2 = probe_device(host)
+            if st2 and not st2.get("playing") and (st2.get("track") or "").strip():
+                play_on_device(host, st2["track"])
+                self.statusBar().showMessage(f"Playing: {st2['track']}")
+            else:
+                self.statusBar().showMessage("Device playback resumed")
+            return
+        path = self._device_project_audio_path()
+        if path:
+            ok, msg = play_on_device(host, path)
+            self.statusBar().showMessage(
+                f"Device play: {msg}" if ok else f"Device play failed: {msg}")
+            return
+        self.statusBar().showMessage(
+            "No track on the device \u2014 upload a project first")
+
+    def _device_pause(self) -> None:
+        ok, msg = pause_device(self._device_host(), "pause")
+        self.statusBar().showMessage(
+            "Device paused" if ok else f"Device pause failed: {msg}")
+
+    # ── Upload project to the device ─────────────────────────────────────────
+
+    def _ask_upload_folder_name(self, host: str, default: str) -> Optional[str]:
+        """Ask for the device folder name, autocompleted from existing folders."""
+        names: list = []
+        data = fetch_dir(host, "/Echoes/Lightshows")
+        if data:
+            names = sorted(e["name"] for e in data.get("entries", [])
+                           if e.get("isDir"))
+
+        from PySide6.QtWidgets import (
+            QCompleter, QDialog, QDialogButtonBox, QLineEdit,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Upload Project to Device")
+        dlg.setMinimumWidth(420)
+        vbox = QVBoxLayout(dlg)
+        vbox.setSpacing(8)
+        vbox.addWidget(QLabel(
+            "Target folder on the device  (/Echoes/Lightshows/<name>):"))
+        edit = QLineEdit(default)
+        if names:
+            edit.setCompleter(QCompleter(names, dlg))
+            edit.setToolTip("Autocomplete from folders already on the device")
+        vbox.addWidget(edit)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        vbox.addWidget(buttons)
+
+        while True:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return None
+            name = edit.text().strip()
+            if not name:
+                QMessageBox.warning(self, "Missing name", "Enter a folder name.")
+                continue
+            if "/" in name or "\\" in name or name in (".", ".."):
+                QMessageBox.warning(
+                    self, "Invalid name",
+                    "The folder name must not contain '/' or '\\'.")
+                continue
+            return name
+
+    def _device_upload_project(self) -> None:
+        """
+        Upload this project (.mp3 + .echoes) to /Echoes/Lightshows/<name>,
+        asking for the folder name (autocompleted) and overwrite permission.
+        """
+        try:
+            self._device_upload_project_impl()
+        except Exception as exc:   # noqa: BLE001 — never fail silently
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(
+                self, "Upload error",
+                f"Unexpected error while preparing the upload:\n\n{exc}")
+
+    def _device_upload_project_impl(self) -> None:
+        if not self._device_paired:
+            QMessageBox.information(
+                self, "Not connected", "Pair with the device first.")
+            return
+        if self._upload_worker is not None:
+            return
+        if not self._script_path:
+            QMessageBox.information(
+                self, "Save first",
+                "Save the project before uploading it to the device.")
+            return
+        audio = self._audio.source_path
+        if not audio or not os.path.isfile(audio):
+            QMessageBox.warning(
+                self, "No audio file",
+                "The project has no local audio file to upload.\n\n"
+                "Use \u201cConvert to .MP3\u201d, Open Audio or "
+                "Load Audio Tracks first.")
+            return
+
+        host = self._device_host()
+
+        # Default folder name: script stem (or its parent folder for generic
+        # names like script.echoes)
+        default = os.path.splitext(os.path.basename(self._script_path))[0]
+        parent  = os.path.basename(
+            os.path.dirname(os.path.abspath(self._script_path)))
+        if default.lower() in ("script", "show", "main") and parent \
+                and parent.lower() not in ("projects", "echoes", "tools"):
+            default = parent
+
+        name = self._ask_upload_folder_name(host, default)
+        if not name:
+            return
+        dest = f"/Echoes/Lightshows/{name}"
+
+        # Overwrite confirmation when the folder already exists
+        if fetch_dir(host, dest) is not None:
+            answer = QMessageBox.question(
+                self, "Folder exists",
+                f"'{name}' already exists on the device.\n"
+                "Overwrite its contents?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+
+        ok, msg = ensure_dir(host, dest)
+        if not ok:
+            QMessageBox.warning(self, "Cannot create folder", msg)
+            return
+
+        # Fast reachability check so a dead device fails immediately instead
+        # of hanging the upload for minutes.
+        if probe_device(host) is None:
+            QMessageBox.warning(
+                self, "Device not reachable",
+                f"{host} stopped responding.\n\n"
+                "Check the device power and that it is still on the same "
+                "Wi-Fi network, then try again.")
+            return
+
+        self._device_project_folder = dest
+        self._device_upload_btn.setEnabled(False)
+        worker = ProjectUploadWorker(host, dest, [audio, self._script_path])
+        worker.progress.connect(self._on_upload_progress)
+        worker.succeeded.connect(self._on_upload_succeeded)
+        worker.failed.connect(self._on_upload_failed)
+        worker.finished.connect(self._on_upload_finished)
+        worker.finished.connect(_upload_reaper.reap)
+        self._upload_worker = worker
+        _upload_workers.append(worker)
+
+        # ── Loading screen ────────────────────────────────────────────────────
+        from PySide6.QtWidgets import QProgressDialog
+        dlg = QProgressDialog("Preparing upload \u2026", "Cancel", 0, 0, self)
+        dlg.setWindowTitle("Uploading to Device")
+        dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.canceled.connect(worker.cancel)
+        dlg.show()
+        self._upload_dialog = dlg
+
+        worker.start()
+
+    def _on_upload_progress(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        if self._upload_dialog is not None:
+            self._upload_dialog.setLabelText(message)
+
+    def _on_upload_succeeded(self, message: str) -> None:
+        self.statusBar().showMessage(message)
+        self._close_upload_dialog()
+        QMessageBox.information(self, "Upload complete", message)
+        if self._device_browser is not None and self._device_browser.isVisible():
+            self._device_browser.refresh()
+
+    def _on_upload_failed(self, message: str) -> None:
+        self.statusBar().showMessage("Upload failed")
+        self._close_upload_dialog()
+        QMessageBox.warning(self, "Upload failed", message)
+
+    def _on_upload_finished(self) -> None:
+        self._upload_worker = None
+        self._device_upload_btn.setEnabled(True)
+        self._close_upload_dialog()
+
+    def _close_upload_dialog(self) -> None:
+        dlg = self._upload_dialog
+        self._upload_dialog = None
+        if dlg is not None:
+            dlg.close()
+            dlg.deleteLater()
+
+    # ── Window lifecycle ──────────────────────────────────────────────────────
+
+    def closeEvent(self, event) -> None:
+        """Persist the window geometry, then stop background threads."""
+        QSettings().setValue("window/geometry", self.saveGeometry())
+        if self._device_browser is not None:
+            self._device_browser.close()
+            self._device_browser = None
+        self._close_upload_dialog()
+        self._stop_status_poller()
+        if self._device_monitor is not None:
+            self._device_monitor.stop()
+            self._device_monitor.wait(5000)
+        super().closeEvent(event)
+
     # ── File operations ───────────────────────────────────────────────────────
+
+    def _new_project(self) -> None:
+        """Clear all project data and start fresh (with confirmation)."""
+        answer = QMessageBox.question(
+            self, "New Project",
+            "Start a new project?\n\n"
+            "The current script, tracks and audio will be cleared.\n"
+            "Save your work first if you want to keep it.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        self._meta = {}
+        self._script_path = None
+        self._audio_files = []
+        self._audio.unload()
+        self._device_project_folder = None
+
+        self._editor.set_tracks({})
+        self._engines.clear()
+        self._rebuild_engines()
+
+        self._transport._bpm.setValue(120)
+        self._transport.set_timesig(4, 4)
+
+        self._set_track_display("No file loaded")
+        self.setWindowTitle("Echoes")
+        self.statusBar().showMessage("New project")
 
     def _open_mp3(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -341,7 +977,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._audio.load(path)
-        self._info_bar.setText(f"  \u266b  {os.path.basename(path)}")
+        self._set_track_display(f"  \u266b  {os.path.basename(path)}")
         self.statusBar().showMessage(f"Loaded: {path}")
 
     def _import_tracks(self) -> None:
@@ -462,7 +1098,7 @@ class MainWindow(QMainWindow):
         audio_file = _find_chart_audio(chart_dir, song_meta)
         if audio_file:
             self._audio.load(os.path.join(chart_dir, audio_file))
-            self._info_bar.setText(f'  \u266b  {audio_file}')
+            self._set_track_display(f'  \u266b  {audio_file}')
             self.statusBar().showMessage(
                 f'Imported: {os.path.basename(path)}  \u2014  '
                 f'audio: {audio_file}  \u2014  {bpm_int} BPM  {ts_num}/{ts_den}'
@@ -480,9 +1116,179 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self._audio.load(path)
-        self._info_bar.setText(f"  \u266b  {os.path.basename(path)}")
+        self._set_audio_files([path])
         self.statusBar().showMessage(f"Loaded: {path}")
+
+    def _open_audio_tracks(self) -> None:
+        """
+        Load up to 6 audio files (e.g. guitar/bass/drums/vocals stems) for a
+        multi-track project. The first file is played for preview; use
+        Convert to .MP3 to mix the selected tracks into a single file.
+        """
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Load Audio Tracks (up to 6)", self._last_audio_dir,
+            "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
+        )
+        if not paths:
+            return
+        if len(paths) > 6:
+            paths = paths[:6]
+            self.statusBar().showMessage(
+                "Audio tracks limited to 6 \u2014 first 6 kept")
+        self._last_audio_dir = os.path.dirname(paths[0])
+        self._set_audio_files(paths)
+        self.statusBar().showMessage(
+            "Loaded " + ", ".join(os.path.basename(p) for p in paths))
+
+    def _set_audio_files(self, paths) -> None:
+        """Adopt *paths* as the project's audio-track list and preview the first."""
+        self._audio_files = [os.path.abspath(p) for p in paths if os.path.isfile(p)]
+        if self._audio_files:
+            self._audio.load(self._audio_files[0])
+            n = len(self._audio_files)
+            self._set_track_display(
+                f"  \u266b  {n} audio track{'s' if n != 1 else ''}"
+                f"  \u2014  {os.path.basename(self._audio_files[0])}")
+        else:
+            self._set_track_display("No file loaded")
+
+    def _set_track_display(self, text: str) -> None:
+        """Update the toolbar info bar and the always-visible transport label."""
+        self._info_bar.setText(text)
+        self._transport.set_track_name(text)
+
+    # ── Audio → MP3 conversion ────────────────────────────────────────────────
+
+    def _find_project_audio(self) -> list:
+        """
+        Audio files found in the current project folder (up to 6), excluding
+        the combined audio referenced by the script's # @audio field.
+        """
+        folder = None
+        if self._script_path:
+            folder = os.path.dirname(self._script_path)
+        else:
+            src = self._audio.source_path
+            if src and os.path.isfile(src):
+                folder = os.path.dirname(src)
+        return find_audio_files(folder or _PROJECTS, limit=6,
+                                exclude=[self._meta.get('audio', '')])
+
+    def _convert_track_sources(self) -> list:
+        """Candidate tracks: folder scan + any separately loaded audio."""
+        found = self._find_project_audio()
+        for p in self._audio_files + ([self._audio.source_path]
+                                      if self._audio.source_path else []):
+            if p and os.path.isfile(p) and len(found) < 6 and not any(
+                    os.path.normcase(p) == os.path.normcase(f) for f in found):
+                found.append(os.path.abspath(p))
+        return found
+
+    def _convert_to_mp3(self) -> None:
+        """
+        Convert audio to .MP3 — with several found tracks, let the user pick
+        which ones are mixed into a single output file (and its name).
+        """
+        if self._mp3_worker is not None:
+            return   # a conversion is already running
+
+        # ── Candidate tracks: found in the project folder + loaded audio ─────
+        sources = self._convert_track_sources()
+        if not sources:
+            src, _ = QFileDialog.getOpenFileName(
+                self, "Select Audio File to Convert", self._last_audio_dir,
+                "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
+            )
+            if not src:
+                return
+            self._last_audio_dir = os.path.dirname(src)
+            sources = [src]
+
+        # Default output name: script stem, else first track stem
+        if self._script_path:
+            default_name = os.path.splitext(
+                os.path.basename(self._script_path))[0] + ".mp3"
+        else:
+            default_name = os.path.splitext(
+                os.path.basename(sources[0]))[0] + ".mp3"
+
+        from ui.track_mix_dialog import TrackMixDialog
+        dlg = TrackMixDialog(sources, default_name, self)
+        if dlg.exec() != TrackMixDialog.DialogCode.Accepted:
+            return
+
+        selected = dlg.selected_tracks()
+        out_folder = (os.path.dirname(os.path.abspath(self._script_path))
+                      if self._script_path
+                      else os.path.dirname(os.path.abspath(selected[0])))
+        dst = os.path.join(out_folder, dlg.output_filename())
+
+        # Never overwrite a source track
+        if any(os.path.normcase(dst) == os.path.normcase(s)
+               for s in selected):
+            QMessageBox.warning(
+                self, "Output conflicts with a source track",
+                f"'{os.path.basename(dst)}' is one of the selected tracks.\n"
+                "Choose a different output file name.")
+            return
+
+        need_ffmpeg = (len(selected) > 1 or
+                       any(os.path.splitext(s)[1].lower() != ".mp3"
+                           for s in selected))
+        if need_ffmpeg and not ffmpeg_available():
+            QMessageBox.warning(
+                self, "ffmpeg not found",
+                "Converting to MP3 requires ffmpeg.\n\n"
+                "1. Download it from https://ffmpeg.org/download.html\n"
+                "2. Extract the archive and add its 'bin' folder to your PATH\n"
+                "3. Restart Echoes and try again.\n\n"
+                "A single MP3 source is copied and does not need ffmpeg.",
+            )
+            return
+
+        # ── Run the conversion off the GUI thread ────────────────────────────
+        self._set_mp3_converting(True)
+        n = len(selected)
+        self.statusBar().showMessage(
+            f"Converting {n} track{'s' if n != 1 else ''} "
+            f"\u2192 {os.path.basename(dst)} \u2026")
+
+        worker = Mp3ConvertWorker(selected[0], dst, self,
+                                  extra_sources=selected[1:],
+                                  normalize=dlg.normalize())
+        worker.succeeded.connect(self._on_mp3_converted)
+        worker.failed.connect(self._on_mp3_convert_failed)
+        worker.finished.connect(self._on_mp3_worker_finished)
+        self._mp3_worker = worker
+        worker.start()
+
+    def _set_mp3_converting(self, converting: bool) -> None:
+        for act in self._mp3_actions:
+            act.setEnabled(not converting)
+
+    def _on_mp3_converted(self, dst: str) -> None:
+        # Work on the combined output: load it and vinculate it to the script
+        self._audio.load(dst)
+        self._audio_files = [dst]
+        self._set_track_display(f"  \u266b  {os.path.basename(dst)}")
+        if self._script_path:
+            self._meta['audio'] = os.path.basename(dst)
+        self.statusBar().showMessage(f"MP3 saved: {dst}")
+        QMessageBox.information(
+            self, "MP3 ready",
+            f"Audio saved to:\n{dst}\n\nLoaded for playback.",
+        )
+
+    def _on_mp3_convert_failed(self, message: str) -> None:
+        self.statusBar().showMessage("MP3 conversion failed")
+        QMessageBox.warning(self, "MP3 conversion failed", message)
+
+    def _on_mp3_worker_finished(self) -> None:
+        self._set_mp3_converting(False)
+        worker = self._mp3_worker
+        self._mp3_worker = None
+        if worker is not None:
+            worker.deleteLater()
 
     def _open_script(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -597,7 +1403,7 @@ class MainWindow(QMainWindow):
         if audio_file:
             audio_path = os.path.join(chart_dir, audio_file)
             self._audio.load(audio_path)
-            self._info_bar.setText(f"  \u266b  {audio_file}")
+            self._set_track_display(f"  \u266b  {audio_file}")
             self.statusBar().showMessage(
                 f"Imported: {os.path.basename(path)}  \u2014  "
                 f"audio: {audio_file}  \u2014  "
@@ -725,7 +1531,7 @@ class MainWindow(QMainWindow):
         audio_file = _find_chart_audio(chart_dir, song_meta)
         if audio_file:
             self._audio.load(os.path.join(chart_dir, audio_file))
-            self._info_bar.setText(f"  \u266b  {audio_file}")
+            self._set_track_display(f"  \u266b  {audio_file}")
             self.statusBar().showMessage(
                 f"Imported: {os.path.basename(path)}  \u2014  "
                 f"audio: {audio_file}  \u2014  {bpm_int} BPM  {ts_num}/{ts_den}"
@@ -749,13 +1555,73 @@ class MainWindow(QMainWindow):
         except OSError as exc:
             QMessageBox.critical(self, "Cannot open file", str(exc))
             return
+        self._apply_script_text(text, path=path)
+
+    def _apply_script_text(self, text: str, path: Optional[str] = None,
+                           title: Optional[str] = None) -> None:
+        """
+        Load *text* into the editor: parse metadata, sync the transport,
+        populate the track slots and rebuild the engines.
+
+        *path* becomes the save target (None = remote/untitled → Save As);
+        *title* overrides the window title (used for device-loaded projects).
+        """
         self._meta = self._parse_meta(text)
         self._sync_meta_to_transport()
         body = self._strip_meta(text)
         self._editor.set_tracks(self._parse_tracks(body))
         self._rebuild_engines()
         self._script_path = path
-        self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
+        if title:
+            self.setWindowTitle(f"Echoes — {title}")
+        elif path:
+            self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
+        # Vinculated audio: load the file recorded in # @audio when available
+        if path:
+            self._load_audio_for_script(path)
+            # Discover multi-track stems for the Convert to .MP3 flow
+            found = self._find_project_audio()
+            if len(found) > 1:
+                self._audio_files = found
+                self.statusBar().showMessage(
+                    f"Found {len(found)} audio tracks \u2014 "
+                    "use \u201cConvert to .MP3\u201d to mix them")
+
+    def _audio_ref_for(self, script_path: str) -> str:
+        """
+        Reference string for the currently loaded audio, relative to the
+        script's folder: the bare filename when the audio sits next to the
+        script (the typical project layout), otherwise a relative path.
+        Returns '' when no local audio file is loaded.
+        """
+        src = self._audio.source_path
+        if not src or not os.path.isfile(src):
+            return ''
+        src = os.path.abspath(src)
+        script_dir = os.path.dirname(os.path.abspath(script_path))
+        if os.path.normcase(os.path.dirname(src)) == os.path.normcase(script_dir):
+            return os.path.basename(src)
+        try:
+            rel = os.path.relpath(src, script_dir)
+        except ValueError:                      # different drive letter
+            return os.path.basename(src)
+        return rel.replace(os.sep, '/')
+
+    def _load_audio_for_script(self, script_path: str) -> None:
+        """Load the audio file recorded in the script metadata, if present."""
+        audio_val = self._meta.get('audio', '').strip()
+        if not audio_val:
+            return
+        if os.path.isabs(audio_val):
+            candidate = audio_val
+        else:
+            candidate = os.path.normpath(
+                os.path.join(os.path.dirname(os.path.abspath(script_path)),
+                             audio_val))
+        if os.path.isfile(candidate):
+            self._set_audio_files([candidate])
+        else:
+            self.statusBar().showMessage(f"Audio not found: {audio_val}")
 
     def _save_script(self) -> None:
         if self._script_path:
@@ -786,6 +1652,10 @@ class MainWindow(QMainWindow):
         dur_ms = self._audio.duration
         if dur_ms:
             self._meta['duration'] = format_ms(dur_ms)
+        # Vinculate the loaded audio so opening the script reloads it
+        audio_val = self._audio_ref_for(path)
+        if audio_val:
+            self._meta['audio'] = audio_val
         tracks = self._editor.get_tracks()
         body   = self._build_tracks_body(tracks)
         try:
@@ -966,7 +1836,7 @@ class MainWindow(QMainWindow):
         """Serialise metadata dict to a # @key  value header block."""
         lines = []
         for key in ('title', 'author', 'charter', 'album', 'year',
-                    'bpm', 'timesig',
+                    'bpm', 'timesig', 'audio',
                     'track1', 'track2', 'track3', 'track4',
                     'duration', 'modified'):
             val = meta.get(key, '').strip()

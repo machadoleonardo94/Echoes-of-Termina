@@ -12,6 +12,7 @@ bool setup_SDCARD()
 {
 
     Serial.println("[SD CARD] SETUP STARTED!");
+    sdcard = false;
 
     // SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0, SDMMC_D1, SDMMC_D2, SDMMC_D3);
     SD_MMC.setPins(SDMMC_CLK, SDMMC_CMD, SDMMC_D0);
@@ -30,7 +31,17 @@ bool setup_SDCARD()
 
     uint64_t cardSize = SD_MMC.cardSize() / (1024 * 1024);
     Serial.printf("SD Card Size: %lluMB\n", cardSize);
-    createDir(SD_MMC, "/Echoes");
+
+    // Dedicated top-level folders for the media library. Idempotent: only
+    // create when missing so the log stays clean on subsequent boots.
+    if (!SD_MMC.exists("/Echoes"))
+        createDir(SD_MMC, "/Echoes");
+    if (!SD_MMC.exists("/Echoes/Music"))
+        createDir(SD_MMC, "/Echoes/Music");
+    if (!SD_MMC.exists("/Echoes/Lightshows"))
+        createDir(SD_MMC, "/Echoes/Lightshows");
+
+    sdcard = true;
     Serial.println("[SD CARD] SETUP FINISHED!");
     return true;
 }
@@ -41,7 +52,7 @@ void updatefromSD()
     Serial.printf("Searching for firmware update..\n");
     if (SD_MMC.remove("/firmware.bak"))
         Serial.printf("Old bak file removed..\n");
-    File firmware = SD_MMC.open("/firmware.bin", FILE_WRITE);
+    File firmware = SD_MMC.open("/firmware.bin", FILE_READ);
     if (firmware)
     {
         Serial.println("Try to update!");

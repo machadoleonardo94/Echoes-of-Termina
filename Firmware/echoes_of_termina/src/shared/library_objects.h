@@ -6,8 +6,11 @@
 
 //* ---------------------- GLOBAL OBJECT INSTANCES ----------------------
 
-// Sets the name of the audio device
-btAudio audio = btAudio("Echoes_of_Termina");
+// Bluetooth A2DP sink (receives audio from a paired device)
+BluetoothA2DPSink a2dp_sink;
+
+// FTP server (power-user file management over the network)
+FtpServer ftpSrv;
 
 //* Preferences (NVS)
 Preferences internal_storage;
