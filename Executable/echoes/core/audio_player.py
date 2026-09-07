@@ -13,6 +13,7 @@ class AudioPlayer(QObject):
     duration_changed = Signal(int)   # total duration in milliseconds
     playing_changed  = Signal(bool)  # True = playing, False = paused/stopped
     error_occurred   = Signal(str)   # human-readable error string
+    source_changed   = Signal(str)   # local path / URL, or '' when unloaded
 
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
@@ -36,14 +37,17 @@ class AudioPlayer(QObject):
 
     def load(self, path: str) -> None:
         self._player.setSource(QUrl.fromLocalFile(path))
+        self.source_changed.emit(path)
 
     def load_url(self, url: str) -> None:
         """Load a remote stream (e.g. audio served by the device portal)."""
         self._player.setSource(QUrl(url))
+        self.source_changed.emit(url)
 
     def unload(self) -> None:
         """Clear the current source (no audio loaded)."""
         self._player.setSource(QUrl())
+        self.source_changed.emit('')
 
     def play(self)  -> None: self._player.play()
     def pause(self) -> None: self._player.pause()

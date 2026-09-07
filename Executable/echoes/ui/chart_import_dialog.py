@@ -19,12 +19,12 @@ from __future__ import annotations
 import json
 import pathlib
 
-from PySide6.QtCore    import Qt
+from PySide6.QtCore    import QByteArray, Qt
 from PySide6.QtGui     import QColor
 from PySide6.QtWidgets import (
     QCheckBox, QColorDialog, QComboBox, QDialog, QDialogButtonBox,
-    QFrame, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-    QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from core.chart_importer import GH_FRET_COLORS, LED_PRESETS, TrackConfig
@@ -56,9 +56,11 @@ def _save_prefs(data: dict) -> None:
 # ── Shared style constants ────────────────────────────────────────────────────
 
 _BASE = (
+    # Text boxes use a noticeably lighter shade than the dark dialog
+    # background so they are easy to spot.
     "QSpinBox, QComboBox, QLineEdit {"
-    "  background:#2d2d2d; color:#d4d4d4;"
-    "  border:1px solid #555; border-radius:3px;"
+    "  background:#3d3d3d; color:#e8e8e8;"
+    "  border:1px solid #666666; border-radius:3px;"
     "  padding:2px 5px; font:11px 'Segoe UI';"
     "}"
     "QSpinBox::up-button, QSpinBox::down-button { width:14px; }"
@@ -136,12 +138,14 @@ class _PresetRow(QWidget):
             init_short = prefs.get('short_ms',     150)
             init_fade  = prefs.get('fade_percent',  80)
             init_lead  = prefs.get('fade_lead_ms', 400)
+            init_label = str(prefs.get('label', f'Preset {preset_idx + 1}'))
         else:
             self._fret_colors = {f: QColor(*rgb) for f, rgb in GH_FRET_COLORS.items()}
             init_leds  = default_leds
             init_short = 150
             init_fade  = 80
             init_lead  = 400
+            init_label = f'Preset {preset_idx + 1}'
 
         # ── outer layout ──────────────────────────────────────────────────────
         outer = QVBoxLayout(self)
@@ -154,10 +158,19 @@ class _PresetRow(QWidget):
         hrow.setContentsMargins(0, 0, 0, 0)
         hrow.setSpacing(10)
 
-        preset_lbl = QLabel(f"Preset {preset_idx + 1}")
-        preset_lbl.setStyleSheet(
-            "color:#e0e0e0; font:bold 11px 'Segoe UI'; min-width:62px;")
-        hrow.addWidget(preset_lbl)
+        # ── editable preset name (persisted, used by Export / Import) ──────
+        self._label = QLineEdit(init_label)
+        self._label.setFixedWidth(110)
+        self._label.setToolTip(
+            "Preset name \u2014 shown on this row and saved with the preset\n"
+            "settings (Export / Import Presets).")
+        self._label.setStyleSheet(
+            "QLineEdit { background:#3d3d3d; color:#e8e8e8; "
+            "border:1px solid #666666; border-radius:3px; "
+            "padding:1px 5px; font:bold 11px 'Segoe UI'; }"
+            "QLineEdit:focus { border-color:#007acc; }"
+        )
+        hrow.addWidget(self._label)
 
         hrow.addWidget(_dim("Source"))
         self._source_combo = QComboBox()
@@ -213,8 +226,10 @@ class _PresetRow(QWidget):
         self._fade.setRange(1, 99); self._fade.setValue(init_fade)
         self._fade.setSuffix("%"); self._fade.setFixedWidth(62)
         self._fade.setToolTip(
-            "Decay rate in % per second.\n"
-            "Higher = quicker fade to black  (e.g. 90 \u2248 1 s,  50 \u2248 7 s).")
+            "Minimum decay rate in % per second.\n"
+            "The importer raises it per note so the LED reaches black when\n"
+            "the note ends (brightness matches the note), up to 99 %/s.\n"
+            "e.g. 90 \u2248 1 s,  50 \u2248 7 s.")
         hrow.addWidget(self._fade)
 
         hrow.addWidget(_dim("Lead"))
@@ -258,13 +273,19 @@ class _PresetRow(QWidget):
                 "Single: 5   Range: 9-16   List: 17,26   All: *   Empty: skip")
             led_inp.textEdited.connect(self._on_led_manually_edited)
             self._led_inputs.append(led_inp)
-            cv.addWidget(led_inp)
 
             btn = QPushButton(str(fret + 1))
             btn.setFixedSize(26, 22)
             btn.clicked.connect(lambda _c, f=fret: self._pick_fret_color(f))
             self._fret_btns.append(btn)
-            cv.addWidget(btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+
+            # Colour box on the left, LED text box on the right
+            fret_row = QHBoxLayout()
+            fret_row.setContentsMargins(0, 0, 0, 0)
+            fret_row.setSpacing(4)
+            fret_row.addWidget(btn)
+            fret_row.addWidget(led_inp)
+            cv.addLayout(fret_row)
 
             frow.addWidget(cell)
 
@@ -389,6 +410,7 @@ class _PresetRow(QWidget):
     def get_prefs(self) -> dict:
         """Serializable snapshot of LED / colour / timing settings for persistence."""
         return {
+            'label':        self._label.text().strip() or f'Preset {self._preset_idx + 1}',
             'fret_colors': [
                 [self._fret_colors[f].red(),
                  self._fret_colors[f].green(),
@@ -400,6 +422,35 @@ class _PresetRow(QWidget):
             'fade_percent': self._fade.value(),
             'fade_lead_ms': self._lead.value(),
         }
+
+    def apply_prefs(self, prefs: dict) -> None:
+        """Restore a saved preset dict (label, colours, LED specs, timing)."""
+        if not isinstance(prefs, dict):
+            return
+        raw_colors = prefs.get('fret_colors', [])
+        if raw_colors:
+            for f in range(5):
+                if f < len(raw_colors):
+                    try:
+                        self._fret_colors[f] = QColor(*raw_colors[f])
+                    except (TypeError, ValueError):
+                        pass
+        saved_leds = prefs.get('fret_leds')
+        if saved_leds:
+            for f, inp in enumerate(self._led_inputs):
+                if f < len(saved_leds):
+                    inp.setText(str(saved_leds[f]))
+        try:
+            self._short.setValue(int(prefs.get('short_ms', self._short.value())))
+            self._fade.setValue(int(prefs.get('fade_percent', self._fade.value())))
+            self._lead.setValue(int(prefs.get('fade_lead_ms', self._lead.value())))
+        except (TypeError, ValueError):
+            pass
+        label = str(prefs.get('label', '')).strip()
+        if label:
+            self._label.setText(label)
+        self._refresh_all_btns()
+        self._sync_preset_combo([inp.text().strip() for inp in self._led_inputs])
 
 
 # ── Main dialog ───────────────────────────────────────────────────────────────
@@ -482,6 +533,14 @@ class ChartImportDialog(QDialog):
         # ── Preset rows (always MAX_TRACKS) ───────────────────────────────────
         prefs = _load_prefs()
 
+        # ── remember the dialog window size across sessions ─────────────────
+        saved_geo = prefs.get('window_geometry')
+        if isinstance(saved_geo, str) and saved_geo:
+            try:
+                self.restoreGeometry(QByteArray.fromBase64(saved_geo.encode('ascii')))
+            except Exception:
+                pass
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet(
@@ -523,6 +582,28 @@ class ChartImportDialog(QDialog):
             " border-radius:3px; padding:4px 16px; font:11px 'Segoe UI'; }"
             "QPushButton:hover { background:#0078c8; }"
         )
+
+        # ── Export / Import preset settings ─────────────────────────────────
+        _preset_btn_style = (
+            "QPushButton { background:#3a3a3a; color:#ccc; border:none;"
+            " border-radius:3px; padding:4px 10px; font:11px 'Segoe UI'; }"
+            "QPushButton:hover { background:#4a4a4a; }"
+        )
+        btn_export = buttons.addButton(
+            "Export Presets\u2026", QDialogButtonBox.ButtonRole.ActionRole)
+        btn_export.setStyleSheet(_preset_btn_style)
+        btn_export.setToolTip(
+            "Save the current preset settings (labels, colours, LED specs,\n"
+            "timing) to a .json file.")
+        btn_export.clicked.connect(self._export_presets)
+
+        btn_import = buttons.addButton(
+            "Import Presets\u2026", QDialogButtonBox.ButtonRole.ActionRole)
+        btn_import.setStyleSheet(_preset_btn_style)
+        btn_import.setToolTip(
+            "Load preset settings from a previously exported .json file.")
+        btn_import.clicked.connect(self._import_presets)
+
         buttons.button(QDialogButtonBox.StandardButton.Cancel).setStyleSheet(
             "QPushButton { background:#3a3a3a; color:#ccc; border:none;"
             " border-radius:3px; padding:4px 12px; font:11px 'Segoe UI'; }"
@@ -534,10 +615,75 @@ class ChartImportDialog(QDialog):
 
     # ── Save prefs on accept ──────────────────────────────────────────────────
 
+    def _remember_geometry(self, data: dict) -> None:
+        """Store the dialog window size in the prefs metadata."""
+        data['window_geometry'] = bytes(
+            self.saveGeometry().toBase64()).decode('ascii')
+
     def accept(self) -> None:
-        data = {f'track_{i}': row.get_prefs() for i, row in enumerate(self._rows)}
+        data = _load_prefs()
+        data.update({f'track_{i}': row.get_prefs()
+                     for i, row in enumerate(self._rows)})
+        self._remember_geometry(data)
         _save_prefs(data)
         super().accept()
+
+    def reject(self) -> None:
+        data = _load_prefs()
+        self._remember_geometry(data)
+        _save_prefs(data)
+        super().reject()
+
+    # ── Export / Import preset settings ───────────────────────────────────────
+
+    def _export_presets(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Preset Settings", "echoes_presets.json",
+            "Echoes presets (*.json);;All Files (*)")
+        if not path:
+            return
+        data = {f'track_{i}': row.get_prefs()
+                for i, row in enumerate(self._rows)}
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                json.dump(data, fh, indent=2)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+            return
+        QMessageBox.information(
+            self, "Presets exported",
+            f"Preset settings saved to:\n{path}")
+
+    def _import_presets(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Preset Settings", "",
+            "Echoes presets (*.json);;All Files (*)")
+        if not path:
+            return
+        try:
+            with open(path, encoding='utf-8') as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Import failed", str(exc))
+            return
+        if not isinstance(data, dict):
+            QMessageBox.warning(self, "Import failed",
+                                "Not a valid presets file.")
+            return
+        n = 0
+        for i, row in enumerate(self._rows):
+            prefs = data.get(f'track_{i}')
+            if isinstance(prefs, dict):
+                row.apply_prefs(prefs)
+                n += 1
+        # Persist immediately so the import survives a dialog cancel
+        saved = _load_prefs()
+        saved.update({f'track_{i}': row.get_prefs()
+                      for i, row in enumerate(self._rows)})
+        _save_prefs(saved)
+        QMessageBox.information(
+            self, "Presets imported",
+            f"Applied settings to {n} preset row(s) from:\n{path}")
 
     # ── Public API ────────────────────────────────────────────────────────────
 

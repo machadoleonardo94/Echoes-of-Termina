@@ -35,6 +35,7 @@ from core.chart_importer import (
     GH_FRET_COLORS, LED_PRESETS, MIN_FLASH_MS,
     TrackConfig,
     _build_tempomap, _tick_to_ms, _fmt_time,
+    _fade_percent_for_black,
 )
 
 # ── Expert 5-fret MIDI note range ─────────────────────────────────────────────
@@ -283,9 +284,11 @@ def convert_midi_tracks(
             t        = _fmt_time(start_ms)
 
             if dur_ms < cfg.short_ms:
+                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     start_ms,
-                    f'{t}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
             else:
                 cmd_lines.append((
@@ -293,9 +296,12 @@ def convert_midi_tracks(
                     f'{t}  SET {r} {g} {b}  {leds}'
                 ))
                 fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+                t_avail = max(start_ms + dur_ms - fade_ms, 1)
+                pct = _fade_percent_for_black(max(r, g, b), t_avail,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
 
     # Sort + deduplicate (same logic as convert_tracks)
@@ -356,9 +362,11 @@ def convert_midi_tracks_per_track(
             t        = _fmt_time(start_ms)
 
             if dur_ms < cfg.short_ms:
+                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     start_ms,
-                    f'{t}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
             else:
                 cmd_lines.append((
@@ -366,9 +374,12 @@ def convert_midi_tracks_per_track(
                     f'{t}  SET {r} {g} {b}  {leds}'
                 ))
                 fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+                t_avail = max(start_ms + dur_ms - fade_ms, 1)
+                pct = _fade_percent_for_black(max(r, g, b), t_avail,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
 
         cmd_lines.sort(key=lambda x: x[0])

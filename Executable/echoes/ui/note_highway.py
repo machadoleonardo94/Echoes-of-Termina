@@ -24,6 +24,7 @@ The widget receives:
 """
 from __future__ import annotations
 
+import bisect
 import math
 
 from PySide6.QtCore    import Qt, QRectF, QPointF
@@ -69,7 +70,10 @@ class NoteHighway(QWidget):
         self._beat_ms   : float = 500.0   # 120 BPM default
         self._commands  : list  = []
         self._led_states: dict  = {}      # {zone_id: (r, g, b)}
-        self.setMinimumSize(200, 60)
+        self._led_cmd_times: dict = {}    # {led: [sorted command time_ms...]}
+        # Keep the minimum small so the main splitter can hand the script
+        # editor a much wider pane when the user drags it.
+        self.setMinimumSize(160, 60)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -80,6 +84,16 @@ class NoteHighway(QWidget):
 
     def update_commands(self, commands: list) -> None:
         self._commands = commands
+        # Per-LED sorted command timestamps, used to cap each command's drawn
+        # hold/tail at the next command that overrides the same LED.
+        self._led_cmd_times = {i: [] for i in range(1, _NUM_LEDS + 1)}
+        for cmd in commands:
+            for led in cmd.leds:
+                times = self._led_cmd_times.get(led)
+                if times is not None:
+                    times.append(cmd.time_ms)
+        for times in self._led_cmd_times.values():
+            times.sort()
         self.update()
 
     def update_leds(self, states: dict) -> None:
@@ -103,6 +117,39 @@ class NoteHighway(QWidget):
     def _lane_cx(self, led_index: int, lane_w: float) -> float:
         """Centre-X of lane for LED with 0-based index."""
         return led_index * lane_w + lane_w * 0.5
+
+    def _next_cmd_ms(self, led: int, t_start: int) -> int | None:
+        """Time of the next command affecting *led* after *t_start*, or None."""
+        times = self._led_cmd_times.get(led)
+        if not times:
+            return None
+        i = bisect.bisect_right(times, t_start)
+        return times[i] if i < len(times) else None
+
+    def _visible_span(self, led: int, t_start: int, hold_end: int | None,
+                      now_ms: int, end_ms: int) -> tuple | None:
+        """
+        Visible time span of one command's effect on *led*.
+
+        The effect starts at *t_start* and runs until *hold_end* (None = the
+        command holds indefinitely, e.g. a SET with nothing after it).  It is
+        capped at the next command on the same LED, because that command
+        overrides the colour and the previous one is no longer visible.
+
+        Returns (vis_bottom_t, vis_top_t) — the portion overlapping the
+        visible window [now_ms, end_ms] — or None when nothing is visible.
+        """
+        nxt = self._next_cmd_ms(led, t_start)
+        if hold_end is not None and nxt is not None:
+            hold_end = min(hold_end, nxt)
+        elif hold_end is None:
+            hold_end = nxt          # overridden (or None = persists forever)
+
+        bot_t = max(t_start, now_ms)
+        top_t = end_ms if hold_end is None else min(hold_end, end_ms)
+        if top_t <= bot_t or top_t <= now_ms or bot_t >= end_ms:
+            return None
+        return (bot_t, top_t)
 
     # ── Qt overrides ─────────────────────────────────────────────────────────
 
@@ -160,74 +207,73 @@ class NoteHighway(QWidget):
         # ── Command markers ───────────────────────────────────────────────────
         now_ms = self._pos_ms
         end_ms = now_ms + window_ms
-        marker_r = lane_w * _MARKER_R_FRAC
-        ramp_w   = lane_w * _RAMP_W_FRAC
+        ramp_w = lane_w * _RAMP_W_FRAC
 
         painter.setPen(Qt.PenStyle.NoPen)
 
+        def _rect_from_span(span) -> tuple | None:
+            """Map a (bot_t, top_t) time span to a clamped (rect_top, rect_bot)."""
+            bot_t, top_t = span
+            y_bot = self._time_to_y(bot_t, hw_h, window_ms)
+            y_top = self._time_to_y(top_t, hw_h, window_ms)
+            rect_top = max(0.0, min(y_bot, y_top))
+            rect_bot = min(hw_h, max(y_bot, y_top))
+            if rect_bot - rect_top < 0.5:
+                return None
+            return (rect_top, rect_bot)
+
         for cmd in self._commands:
             t_start = cmd.time_ms
-
-            # ── Visibility (FADE has its own check below) ─────────────────────
-            if isinstance(cmd, RampCommand):
-                if not (t_start < end_ms and t_start + cmd.duration_ms > now_ms):
-                    continue
-            elif isinstance(cmd, FadeCommand):
-                pass   # handled per-block
-            else:
-                if not (now_ms <= t_start <= end_ms):
-                    continue
-
-            y_trig = self._time_to_y(t_start, hw_h, window_ms)
 
             # ── Per-type rendering ────────────────────────────────────────────
             if isinstance(cmd, SetCommand):
                 r, g, b = cmd.r, cmd.g, cmd.b
                 if r == 0 and g == 0 and b == 0:
                     continue   # transparent — nothing to draw
-                # Solid bar from the trigger up to the top of the highway.
-                # SET holds at full brightness indefinitely (no decay), so the
-                # bar has no gradient; it extends to the window edge to convey
-                # that the colour will persist past the visible lookahead.
+                # SET holds at full brightness until the next command on the
+                # same LED (or indefinitely).  Draw that hold so the lane stays
+                # lit after the note fires instead of vanishing at the trigger.
                 bar_w = lane_w * _RAMP_W_FRAC
-                bar_h = max(y_trig, 2.0)        # y_trig = pixels from top to trigger
-                # Body: slightly transparent so beat-grid lines remain visible
-                painter.setBrush(QBrush(QColor(r, g, b, 180)))
                 for led in cmd.leds:
                     idx = led - 1
                     if not (0 <= idx < _NUM_LEDS):
                         continue
-                    cx = self._lane_cx(idx, lane_w)
-                    painter.drawRect(QRectF(cx - bar_w * 0.5, 0.0, bar_w, bar_h))
-                # Bright cap at the trigger edge (note-head)
-                painter.setBrush(QBrush(QColor(r, g, b, 255)))
-                for led in cmd.leds:
-                    idx = led - 1
-                    if not (0 <= idx < _NUM_LEDS):
+                    span = self._visible_span(led, t_start, None, now_ms, end_ms)
+                    if span is None:
                         continue
+                    rect = _rect_from_span(span)
+                    if rect is None:
+                        continue
+                    rect_top, rect_bot = rect
                     cx = self._lane_cx(idx, lane_w)
+                    # Body: slightly transparent so beat-grid lines stay visible
+                    painter.setBrush(QBrush(QColor(r, g, b, 180)))
                     painter.drawRect(QRectF(
-                        cx - bar_w * 0.5, y_trig - 2.0, bar_w, 3.0))
+                        cx - bar_w * 0.5, rect_top, bar_w,
+                        rect_bot - rect_top))
+                    # Bright cap at the trigger edge while the note approaches
+                    if t_start >= now_ms:
+                        y_trig = self._time_to_y(t_start, hw_h, window_ms)
+                        if 0.0 <= y_trig <= hw_h:
+                            painter.setBrush(QBrush(QColor(r, g, b, 255)))
+                            painter.drawRect(QRectF(
+                                cx - bar_w * 0.5, y_trig - 2.0, bar_w, 3.0))
 
             elif isinstance(cmd, FadeCommand):
                 r, g, b = cmd.r, cmd.g, cmd.b
                 if r == 0 and g == 0 and b == 0:
                     continue   # transparent
-                # Duration until integer-truncated decay reaches ≤ 2
+                # Time until the integer-truncated decay reaches black (0),
+                # matching ScriptEngine.evaluate_at / the LED strip below.
                 max_val = max(r, g, b)
-                if cmd.percent > 0 and cmd.percent < 100 and max_val > 2:
-                    decay = (100 - cmd.percent) / 100.0
-                    t_s   = math.log(2.0 / max_val) / math.log(decay)
-                    fade_end_ms = t_start + t_s * 1000.0
+                decay   = (100 - cmd.percent) / 100.0
+                if 0 < decay < 1 and max_val > 0:
+                    t_black_s = math.log(1.0 / max_val) / math.log(decay)
+                    fade_end_ms = t_start + t_black_s * 1000.0
                 else:
                     fade_end_ms = t_start + 50.0
 
-                # Skip if not yet started or fully decayed
-                if t_start > end_ms or fade_end_ms < now_ms:
-                    continue
-
-                # Anchor the bar bottom to max(trigger, now) so the decaying
-                # tail stays visible above the now-line after the note fires
+                # Current decayed colour at the visible bottom of the tail
                 eff_start = max(float(t_start), float(now_ms))
                 elapsed_s = (eff_start - t_start) / 1000.0
                 if elapsed_s > 0 and 0 < decay < 1:
@@ -238,34 +284,36 @@ class NoteHighway(QWidget):
                 else:
                     r_now, g_now, b_now = r, g, b
 
-                y_bot    = self._time_to_y(eff_start, hw_h, window_ms)
-                y_top    = self._time_to_y(fade_end_ms, hw_h, window_ms)
-                rect_top = max(0.0, min(y_bot, y_top))
-                rect_bot = min(hw_h, max(y_bot, y_top))
-                rect_h   = max(rect_bot - rect_top, 2.0)
-                bar_w    = lane_w * _RAMP_W_FRAC
-
                 for led in cmd.leds:
                     idx = led - 1
                     if not (0 <= idx < _NUM_LEDS):
                         continue
+                    # Tail ends at the real black point — or earlier when the
+                    # next command on this LED takes over — so the fade ends
+                    # in sync with the LED (and the note grid).
+                    span = self._visible_span(
+                        led, t_start, int(fade_end_ms), now_ms, end_ms)
+                    if span is None:
+                        continue
+                    rect = _rect_from_span(span)
+                    if rect is None:
+                        continue
+                    rect_top, rect_bot = rect
                     cx = self._lane_cx(idx, lane_w)
-                    # Y gradient: current decayed colour at bottom → transparent at top
+                    # Y gradient: current decayed colour at bottom → black,
+                    # transparent at the top (where the fade actually ends)
                     grad = QLinearGradient(cx, rect_bot, cx, rect_top)
                     grad.setColorAt(0.0, QColor(r_now, g_now, b_now, 230))
-                    grad.setColorAt(1.0, QColor(r_now, g_now, b_now, 0))
+                    grad.setColorAt(1.0, QColor(0, 0, 0, 0))
                     painter.setBrush(QBrush(grad))
-                    painter.drawRect(QRectF(cx - bar_w * 0.5, rect_top, bar_w, rect_h))
+                    painter.drawRect(QRectF(
+                        cx - ramp_w * 0.5, rect_top, ramp_w,
+                        rect_bot - rect_top))
 
             elif isinstance(cmd, RampCommand):
                 r,  g,  b  = cmd.r0, cmd.g0, cmd.b0
                 r1, g1, b1 = cmd.r1, cmd.g1, cmd.b1
-
-                t_end    = t_start + cmd.duration_ms
-                y_end    = self._time_to_y(t_end, hw_h, window_ms)
-                rect_top = max(0.0, min(y_trig, y_end))
-                rect_bot = min(hw_h, max(y_trig, y_end))
-                rect_h   = max(rect_bot - rect_top, 2.0)
+                t_end = t_start + cmd.duration_ms
 
                 c0 = QColor(r,  g,  b,  0 if (r  == 0 and g  == 0 and b  == 0) else 230)
                 c1 = QColor(r1, g1, b1, 0 if (r1 == 0 and g1 == 0 and b1 == 0) else 230)
@@ -274,6 +322,13 @@ class NoteHighway(QWidget):
                     idx = led - 1
                     if not (0 <= idx < _NUM_LEDS):
                         continue
+                    span = self._visible_span(led, t_start, t_end, now_ms, end_ms)
+                    if span is None:
+                        continue
+                    rect = _rect_from_span(span)
+                    if rect is None:
+                        continue
+                    rect_top, rect_bot = rect
                     cx = self._lane_cx(idx, lane_w)
                     x0 = cx - ramp_w * 0.5
                     x1 = cx + ramp_w * 0.5
@@ -282,7 +337,8 @@ class NoteHighway(QWidget):
                     grad.setColorAt(0.0, c0)
                     grad.setColorAt(1.0, c1)
                     painter.setBrush(QBrush(grad))
-                    painter.drawRect(QRectF(x0, rect_top, ramp_w, rect_h))
+                    painter.drawRect(QRectF(
+                        x0, rect_top, ramp_w, rect_bot - rect_top))
 
         # ── "Now" line ────────────────────────────────────────────────────────
         painter.setPen(QPen(_NOW_LINE, 2.0))

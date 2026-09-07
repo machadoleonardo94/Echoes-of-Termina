@@ -16,12 +16,17 @@ Fret → LED mapping  (V1 hardware, symmetric spikes)
 
 Note handling
 ─────────────
-  Short note  (clamped to ≥ 100 ms)  →  FADE 255 255 255 80 <leds>
-  Long  note  (≥ SHORT_MS threshold) →  SET  255 255 255 <leds>
-                                         FADE 255 255 255 80 <leds>   (FADE_LEAD_MS before end)
+  Short note  (clamped to ≥ 100 ms)  →  FADE <color> <pct> <leds>
+  Long  note  (≥ SHORT_MS threshold) →  SET   <color> <leds>
+                                         FADE <color> <pct> <leds>   (FADE_LEAD_MS before end)
+
+  The FADE percent is computed per note so the LED reaches black exactly when
+  the note ends (the LED brightness matches the note timeline).  Notes too
+  short for even the fastest decay (99 %/s) fall back to 99 %.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Optional
@@ -38,8 +43,28 @@ FRET_TO_LEDS: dict[int, str] = {
 
 SHORT_MS       = 150    # notes shorter than this are "flash" notes
 MIN_FLASH_MS   = 100    # minimum duration for a flash note
-FADE_PERCENT   = 80     # decay % per second for FADE command
+FADE_PERCENT   = 80     # fallback decay % per second for FADE command
 FADE_LEAD_MS   = 400    # how early before a long note's end to issue FADE
+
+
+def _fade_percent_for_black(max_val: int, t_ms: float, fallback: int) -> int:
+    """
+    FADE percent (1-99) whose exponential decay reaches black (integer
+    brightness 0) within *t_ms* milliseconds.
+
+    This makes the LED brightness match the note: it is lit while the note
+    plays and reaches black when the note ends.  The user-configured
+    *fallback* rate is kept as a floor (fades never decay slower than asked);
+    the computed value is capped at 99 (the fastest possible) when the note is
+    too short to reach black in time.
+    """
+    if max_val <= 0 or t_ms <= 0:
+        return max(1, min(99, fallback))
+    t = t_ms / 1000.0
+    # brightness(t) = max_val * ((100 - pct)/100) ** t  <  1  →  decay < max_val ** (-1/t)
+    pct = math.ceil(100.0 * (1.0 - max_val ** (-1.0 / t)))
+    pct = max(pct, max(1, min(99, fallback)))
+    return max(1, min(99, pct))
 
 # ── Fret / LED presets ────────────────────────────────────────────────────────
 
@@ -384,21 +409,25 @@ def convert(chart_text: str) -> tuple[str, Optional[str]]:
         t    = _fmt_time(start_ms)
 
         if dur_ms < SHORT_MS:
-            # Flash note: single FADE
+            # Flash note: single FADE, as fast as the note allows
+            pct = _fade_percent_for_black(255, dur_ms, FADE_PERCENT)
             cmd_lines.append((
                 start_ms,
-                f'{t}  FADE 255 255 255 {FADE_PERCENT}  {leds}'
+                f'{t}  FADE 255 255 255 {pct}  {leds}'
             ))
         else:
-            # Sustain: SET at start, FADE near end
+            # Sustain: SET at start, FADE near end that reaches black at the
+            # note end (or as fast as possible when the note is too short)
             cmd_lines.append((
                 start_ms,
                 f'{t}  SET 255 255 255  {leds}'
             ))
             fade_ms = max(start_ms + dur_ms - FADE_LEAD_MS, start_ms + 50)
+            t_avail = max(start_ms + dur_ms - fade_ms, 1)
+            pct = _fade_percent_for_black(255, t_avail, FADE_PERCENT)
             cmd_lines.append((
                 fade_ms,
-                f'{_fmt_time(fade_ms)}  FADE 255 255 255 {FADE_PERCENT}  {leds}'
+                f'{_fmt_time(fade_ms)}  FADE 255 255 255 {pct}  {leds}'
             ))
 
     # Sort all commands by time, then deduplicate adjacent identical lines
@@ -454,9 +483,11 @@ def convert_tracks(
             t        = _fmt_time(start_ms)
 
             if dur_ms < cfg.short_ms:
+                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     start_ms,
-                    f'{t}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
             else:
                 cmd_lines.append((
@@ -464,9 +495,12 @@ def convert_tracks(
                     f'{t}  SET {r} {g} {b}  {leds}'
                 ))
                 fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+                t_avail = max(start_ms + dur_ms - fade_ms, 1)
+                pct = _fade_percent_for_black(max(r, g, b), t_avail,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
 
     # Build header
@@ -530,9 +564,11 @@ def convert_tracks_per_track(
             t        = _fmt_time(start_ms)
 
             if dur_ms < cfg.short_ms:
+                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     start_ms,
-                    f'{t}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
             else:
                 cmd_lines.append((
@@ -540,9 +576,12 @@ def convert_tracks_per_track(
                     f'{t}  SET {r} {g} {b}  {leds}'
                 ))
                 fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+                t_avail = max(start_ms + dur_ms - fade_ms, 1)
+                pct = _fade_percent_for_black(max(r, g, b), t_avail,
+                                              cfg.fade_percent)
                 cmd_lines.append((
                     fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {cfg.fade_percent}  {leds}'
+                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
                 ))
 
         cmd_lines.sort(key=lambda x: x[0])

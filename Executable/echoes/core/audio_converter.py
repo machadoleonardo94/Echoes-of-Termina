@@ -21,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+from array import array
 
 from PySide6.QtCore import QThread, Signal
 
@@ -106,6 +107,71 @@ def convert_to_mp3(source: str, destination: str, bitrate: str = MP3_BITRATE):
     except subprocess.CalledProcessError as exc:
         return False, f"ffmpeg failed:\n{exc}"
     return True, f"Converted to {destination}"
+
+
+_ENV_RATE = 44100   # envelope decode rate (Hz) — fixed so bucket math is stable
+
+
+def extract_envelope(path: str, bucket_ms: int = 10):
+    """
+    Decode *path* to a mono peak + RMS envelope with ffmpeg in one fast pass.
+
+    Returns ``(peaks, rms, duration_ms)`` where each entry is a per-bucket
+    amplitude (0..1) for the time bucket ``[b*bucket_ms, (b+1)*bucket_ms)``:
+    ``peaks`` is the absolute peak and ``rms`` the root-mean-square level.
+    Returns None when ffmpeg is missing or the file cannot be decoded.
+
+    The RMS layer is what reveals a song's structure even for hot, clipped
+    masters (whose peaks sit at full scale for most of the track); the peak
+    layer is kept for the familiar waveform outline.  ffmpeg is used instead
+    of Qt's QAudioDecoder because the latter delivers thousands of tiny
+    buffers at a throttled rate (~20 s for a 2.5-minute song), while ffmpeg
+    decodes the whole file in well under a second.
+    """
+    if not os.path.isfile(path) or not ffmpeg_available():
+        return None
+
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-i", path,
+           "-f", "f32le", "-ac", "1", "-ar", str(_ENV_RATE), "-"]
+    try:
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE,
+                              stderr=subprocess.DEVNULL, check=True)
+    except (subprocess.CalledProcessError, OSError):
+        return None
+
+    data = proc.stdout
+    n_samples = len(data) // 4
+    if n_samples == 0:
+        return None
+    samples = array('f')
+    samples.frombytes(data[:n_samples * 4])
+
+    fpb = _ENV_RATE * bucket_ms / 1000.0          # samples per bucket (fractional)
+    peaks: list[float] = []
+    rms:   list[float] = []
+    start = 0
+    while start < n_samples:
+        bucket = int(start / fpb)
+        end = min(n_samples, int((bucket + 1) * fpb))
+        if end <= start:                          # guard fractional-drift edge
+            end = start + 1
+        sl = samples[start:end]
+        m = max(abs(min(sl)), abs(max(sl)))
+        if m > 1.0:
+            m = 1.0
+        count = len(sl)
+        r = (sum(v * v for v in sl) / count) ** 0.5 if count else 0.0
+        if bucket >= len(peaks):
+            peaks.extend([0.0] * (bucket + 1 - len(peaks)))
+            rms.extend([0.0] * (bucket + 1 - len(rms)))
+        if m > peaks[bucket]:
+            peaks[bucket] = m
+        if r > rms[bucket]:
+            rms[bucket] = r
+        start = end
+
+    duration_ms = round(n_samples / _ENV_RATE * 1000)
+    return peaks, rms, duration_ms
 
 
 def mix_to_mp3(sources, destination: str, bitrate: str = MP3_BITRATE,

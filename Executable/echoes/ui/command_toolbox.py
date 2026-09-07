@@ -26,7 +26,11 @@ def _spin(lo: int, hi: int, val: int,
     s = QSpinBox()
     s.setRange(lo, hi)
     s.setValue(val)
-    s.setFixedSize(w, 24)
+    # Shrinkable: keeps *w* when there is room, compresses when the pane is
+    # narrow — so the toolbox does not force the right pane wide and the
+    # script editor can be widened.
+    s.setMinimumSize(26, 24)
+    s.setMaximumSize(w, 24)
     s.setAlignment(Qt.AlignmentFlag.AlignCenter)
     s.setToolTip(tip)
     s.setStyleSheet(
@@ -39,7 +43,8 @@ def _spin(lo: int, hi: int, val: int,
 
 def _line(val: str, bg: str, fg: str, tip: str = "", w: int = 54) -> QLineEdit:
     e = QLineEdit(val)
-    e.setFixedSize(w, 24)
+    e.setMinimumSize(40, 24)
+    e.setMaximumSize(w, 24)
     e.setAlignment(Qt.AlignmentFlag.AlignCenter)
     e.setToolTip(tip)
     e.setStyleSheet(
@@ -108,7 +113,8 @@ class CommandToolbox(QWidget):
 
         # Live timestamp label
         self._ts_label = QLabel("0:00.00")
-        self._ts_label.setFixedSize(72, 26)
+        self._ts_label.setMinimumSize(56, 26)
+        self._ts_label.setMaximumSize(72, 26)
         self._ts_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._ts_label.setStyleSheet(
             "color:#4ec9b0; font:bold 11px 'Consolas'; "
@@ -195,7 +201,8 @@ class CommandToolbox(QWidget):
         row.addWidget(_slot_lbl)
 
         self._slot_combo = QComboBox()
-        self._slot_combo.setFixedSize(140, 26)
+        self._slot_combo.setMinimumSize(90, 26)
+        self._slot_combo.setMaximumSize(140, 26)
         self._slot_combo.setToolTip("Target slot — the ADD button inserts into this track")
         self._slot_combo.setStyleSheet(
             "QComboBox { background:#2a2a2a; color:#9cdcfe; "

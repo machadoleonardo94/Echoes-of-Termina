@@ -46,7 +46,9 @@ class LEDCanvas(QWidget):
         self._led_states: dict = {}
         self._zones:      list = []
         self._last_transform: QTransform = QTransform()
-        self.setMinimumSize(320, 240)
+        # Keep the minimum small so the main splitter can hand the script
+        # editor a much wider pane when the user drags it.
+        self.setMinimumSize(240, 200)
 
         px = QPixmap(_BG_PATH)
         self._pixmap: Optional[QPixmap] = px if (px and not px.isNull()) else None

@@ -15,8 +15,8 @@
 
 //* I2S PINS (I2S_NUM_1 — INMP441 microphone):
 //* Wire INMP441 L/R pin to GND for left-channel output.
-#define MIC_SCK 26 // INMP441 SCK
-#define MIC_WS 27  // INMP441 WS
+#define MIC_SCK 27 // INMP441 SCK
+#define MIC_WS 26  // INMP441 WS
 #define MIC_SD 34  // INMP441 SD
 
 //* SDMMC PINS:

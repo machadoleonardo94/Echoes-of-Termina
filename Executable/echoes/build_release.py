@@ -14,8 +14,8 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
+VERSION  = "0.7.0"
 
-VERSION  = "0.6.0"
 HERE     = Path(__file__).resolve().parent   # tools/echoes/
 DIST_DIR = HERE / "dist"
 ZIP_PATH = DIST_DIR / f"Echoes_v{VERSION}.zip"

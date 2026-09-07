@@ -1,14 +1,19 @@
 """
-Single-row audio transport bar:
-  ⏹  ▶/⏸  ⏮ ⏭  0:15.50  ─────●──────  3:45.00  🔊 ─●──  BPM [___]
+Three-row audio transport bar:
+  ⏹  ⏮ ⏭  ▶  ⊙   🔊 ─●──  BPM [___]  [4/4]   ← controls (⊙ = Sync)
+  0:15.50  ─────●──────  3:45.00             ← time · progress · end time
+  ══ audio envelope (drag grip to collapse/stretch) ══
 """
 from __future__ import annotations
 
-from PySide6.QtCore    import Qt, QTimer, Signal
+from PySide6.QtCore    import QPointF, QRectF, Qt, QSettings, QTimer, Signal
+from PySide6.QtGui     import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit,
-                                QPushButton, QSlider, QSpinBox, QWidget)
+                                QPushButton, QSlider, QSpinBox, QVBoxLayout,
+                                QWidget)
 
 from core.audio_player import AudioPlayer
+from ui.envelope_viewer import EnvelopeViewer
 
 
 def _fmt(ms: int) -> str:
@@ -17,6 +22,28 @@ def _fmt(ms: int) -> str:
     total_s = ms // 1000
     cs      = (ms % 1000) // 10
     return f"{total_s // 60}:{total_s % 60:02d}.{cs:02d}"
+
+
+def _target_icon() -> QIcon:
+    """A small crosshair / target logo for the Sync button."""
+    size = 18
+    pm = QPixmap(size, size)
+    pm.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor("#9cdcfe"), 1.2)
+    p.setPen(pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    c = size / 2.0
+    p.drawEllipse(QRectF(c - 6.0, c - 6.0, 12.0, 12.0))   # outer ring
+    p.drawEllipse(QRectF(c - 2.5, c - 2.5,  5.0,  5.0))   # inner ring
+    p.drawLine(QPointF(c - 8.0, c), QPointF(c + 8.0, c))  # crosshair
+    p.drawLine(QPointF(c, c - 8.0), QPointF(c, c + 8.0))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(QColor("#9cdcfe")))
+    p.drawEllipse(QRectF(c - 1.0, c - 1.0, 2.0, 2.0))     # centre dot
+    p.end()
+    return QIcon(pm)
 
 
 _SEEK_GROOVE = """
@@ -68,13 +95,20 @@ class TransportBar(QWidget):
         self._build()
         self._wire()
         self._update_step_tips()
+        # Apply the restored volume to the player: the slider's setValue() in
+        # _build() ran before the valueChanged connection existed, so without
+        # this the audio would stay at the player's default (100 %) on boot.
+        self._player.set_volume(self._vol.value() / 100.0)
 
     # ── Construction ─────────────────────────────────────────────────────────
 
     def _build(self) -> None:
-        self.setFixedHeight(44)
-        row = QHBoxLayout(self)
-        row.setContentsMargins(10, 0, 10, 0)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 2, 10, 2)
+        root.setSpacing(2)
+
+        # ── Row 1 — transport controls ────────────────────────────────────────
+        row = QHBoxLayout()
         row.setSpacing(6)
 
         # ── Stop / Play-Pause
@@ -114,46 +148,54 @@ class TransportBar(QWidget):
             b.setFixedSize(30, 28)
             b.setStyleSheet(_skip_style)
 
-        # ── Position box  (editable — type a timestamp and press Enter to seek)
-        self._lbl_pos = QLineEdit("0:00.00")
-        self._lbl_pos.setFixedWidth(68)
-        self._lbl_pos.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_pos.setToolTip("Current position — type M:SS.cc and press Enter to seek")
-        self._lbl_pos.setStyleSheet(
-            "QLineEdit {"
-            "  font: 11px 'Consolas', monospace; color: #aaaaaa;"
-            "  background: transparent; border: 1px solid transparent;"
-            "  border-radius: 3px; padding: 0 3px;"
-            "}"
-            "QLineEdit:focus {"
-            "  color: #e8e8e8; background: #2d2d2d;"
-            "  border-color: #007acc;"
-            "}")
+        row.addWidget(self._btn_stop)
+        row.addSpacing(2)
+        row.addWidget(self._btn_back_1)
+        row.addWidget(self._btn_back_h)
+        row.addWidget(self._btn_back_q)
+        row.addWidget(self._btn_back_e)
+        row.addSpacing(2)
+        row.addWidget(self._btn_pp)
+        row.addSpacing(2)
+        row.addWidget(self._btn_next_e)
+        row.addWidget(self._btn_next_q)
+        row.addWidget(self._btn_next_h)
+        row.addWidget(self._btn_next_1)
+        row.addSpacing(2)
 
-        # ── Duration label  (M:SS.cc)
-        self._lbl_dur = QLabel("0:00.00")
-        self._lbl_dur.setFixedWidth(62)
-        self._lbl_dur.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self._lbl_dur.setStyleSheet(
-            "font: 11px 'Consolas', monospace; color: #555555;")
+        # ── Sync — snap the current time to the nearest beat on the fret board
+        self._btn_sync = QPushButton()
+        self._btn_sync.setIcon(_target_icon())
+        self._btn_sync.setFixedSize(30, 28)
+        self._btn_sync.setStyleSheet(
+            "QPushButton { background:#2a2a2a; border:1px solid #444; "
+            "border-radius:3px; padding:0; }"
+            "QPushButton:hover { background:#3a3a3a; border-color:#007acc; }"
+            "QPushButton:pressed { background:#1a1a1a; }"
+        )
+        self._btn_sync.setToolTip(
+            "Sync \u2014 snap the current time to the nearest beat\n"
+            "on the fret board grid (BPM-based).")
+        row.addWidget(self._btn_sync)
 
-        # ── Seek slider
-        self._seek = QSlider(Qt.Orientation.Horizontal)
-        self._seek.setMinimum(0)
-        self._seek.setMaximum(0)
-        self._seek.setSingleStep(10)     # 10 ms
-        self._seek.setPageStep(1_000)    # 1 s
-        self._seek.setStyleSheet(_SEEK_GROOVE)
+        row.addSpacing(4)
+        row.addStretch(1)     # pushes the right-side controls to the edge
 
-        # ── Volume
+        # ── Volume (persisted across sessions)
         self._lbl_vol = QLabel("🔊")
         self._lbl_vol.setStyleSheet("font-size: 12px; color: #666666;")
         self._vol = QSlider(Qt.Orientation.Horizontal)
         self._vol.setRange(0, 100)
-        self._vol.setValue(80)
+        try:
+            saved_vol = int(QSettings().value("audio/volume", 80))
+        except (TypeError, ValueError):
+            saved_vol = 80
+        self._vol.setValue(max(0, min(100, saved_vol)))
         self._vol.setFixedWidth(70)
         self._vol.setStyleSheet(_VOL_GROOVE)
+        row.addWidget(self._lbl_vol)
+        row.addWidget(self._vol)
+        row.addSpacing(6)
 
         # ── BPM spinbox
         self._lbl_bpm = QLabel("BPM")
@@ -171,6 +213,9 @@ class TransportBar(QWidget):
         self._bpm.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._bpm.setToolTip("Beats per minute — controls beat-step size")
         self._bpm.setStyleSheet(_spin_style)
+        row.addWidget(self._lbl_bpm)
+        row.addWidget(self._bpm)
+        row.addSpacing(4)
 
         # ── Time-signature  (numerator spinbox  /  denominator combobox)
         self._lbl_ts_sep = QLabel("/")
@@ -199,53 +244,68 @@ class TransportBar(QWidget):
         self._ts_den.setFixedWidth(36)
         self._ts_den.setToolTip("Beat unit — denominator of the time signature")
         self._ts_den.setStyleSheet(_den_style)
-
-        # ── Layout
-        row.addWidget(self._btn_stop)
-        row.addSpacing(2)
-        row.addWidget(self._btn_back_1)
-        row.addWidget(self._btn_back_h)
-        row.addWidget(self._btn_back_q)
-        row.addWidget(self._btn_back_e)
-        row.addSpacing(2)
-        row.addWidget(self._btn_pp)
-        row.addSpacing(2)
-        row.addWidget(self._btn_next_e)
-        row.addWidget(self._btn_next_q)
-        row.addWidget(self._btn_next_h)
-        row.addWidget(self._btn_next_1)
-        row.addSpacing(4)
-
-        # ── Loaded-track name (always visible, elided on narrow windows) ─────
-        self._track_name = ""
-        self._track_label = QLabel("")
-        self._track_label.setMinimumWidth(40)
-        self._track_label.setStyleSheet(
-            "color:#888888; font:11px 'Segoe UI';")
-        self._track_label.setToolTip("Loaded audio")
-        row.addWidget(self._track_label, stretch=1)
-
-        row.addWidget(self._lbl_pos)
-        row.addWidget(self._seek, stretch=2)
-        row.addWidget(self._lbl_dur)
-        row.addSpacing(4)
-        row.addWidget(self._lbl_vol)
-        row.addWidget(self._vol)
-        row.addSpacing(6)
-        row.addWidget(self._lbl_bpm)
-        row.addWidget(self._bpm)
-        row.addSpacing(4)
         row.addWidget(self._ts_num)
         row.addWidget(self._lbl_ts_sep)
         row.addWidget(self._ts_den)
+
+        root.addLayout(row)
+
+        # ── Row 2 — current time · progress bar · end time ───────────────────
+        trow = QHBoxLayout()
+        trow.setSpacing(8)
+
+        # ── Position box  (editable — type a timestamp and press Enter to seek)
+        self._lbl_pos = QLineEdit("0:00.00")
+        self._lbl_pos.setFixedWidth(68)
+        self._lbl_pos.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._lbl_pos.setToolTip("Current position — type M:SS.cc and press Enter to seek")
+        self._lbl_pos.setStyleSheet(
+            "QLineEdit {"
+            "  font: 11px 'Consolas', monospace; color: #aaaaaa;"
+            "  background: transparent; border: 1px solid transparent;"
+            "  border-radius: 3px; padding: 0 3px;"
+            "}"
+            "QLineEdit:focus {"
+            "  color: #e8e8e8; background: #2d2d2d;"
+            "  border-color: #007acc;"
+            "}")
+
+        # ── Seek slider
+        self._seek = QSlider(Qt.Orientation.Horizontal)
+        self._seek.setMinimum(0)
+        self._seek.setMaximum(0)
+        self._seek.setSingleStep(10)     # 10 ms
+        self._seek.setPageStep(1_000)    # 1 s
+        self._seek.setStyleSheet(_SEEK_GROOVE)
+
+        # ── Duration label  (M:SS.cc)
+        self._lbl_dur = QLabel("0:00.00")
+        self._lbl_dur.setFixedWidth(62)
+        self._lbl_dur.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._lbl_dur.setStyleSheet(
+            "font: 11px 'Consolas', monospace; color: #555555;")
+
+        trow.addWidget(self._lbl_pos)
+        trow.addWidget(self._seek, stretch=2)
+        trow.addWidget(self._lbl_dur)
+
+        root.addLayout(trow)
+
+        # ── Row 3 — audio envelope (collapsible / stretchable) ───────────────
+        self._envelope = EnvelopeViewer()
+        root.addWidget(self._envelope, stretch=0)
 
     def _wire(self) -> None:
         self._player.position_changed.connect(self._on_pos)
         self._player.duration_changed.connect(self._on_dur)
         self._player.playing_changed.connect(self._on_playing)
+        self._player.source_changed.connect(self._envelope.set_audio_source)
 
-        self._seek.sliderPressed.connect(
-            lambda: setattr(self, '_seeking', True))
+        # An audio file may already be loaded before this bar was built
+        self._envelope.set_audio_source(self._player.source_path)
+
+        self._seek.sliderPressed.connect(self._on_slider_pressed)
         self._seek.sliderReleased.connect(self._on_release)
         self._seek.sliderMoved.connect(self._on_moved)
 
@@ -259,8 +319,8 @@ class TransportBar(QWidget):
         self._btn_next_q.clicked.connect(lambda: self._step(0.25))
         self._btn_next_h.clicked.connect(lambda: self._step(0.5))
         self._btn_next_1.clicked.connect(lambda: self._step(1.0))
-        self._vol.valueChanged.connect(
-            lambda v: self._player.set_volume(v / 100.0))
+        self._btn_sync.clicked.connect(self._on_sync)
+        self._vol.valueChanged.connect(self._on_volume_changed)
         self._bpm.valueChanged.connect(self._on_bpm_changed)
         self._ts_num.valueChanged.connect(
             lambda n: setattr(self, '_beats_per_bar', n))
@@ -287,14 +347,39 @@ class TransportBar(QWidget):
         self._beat_ms = round(60_000 / bpm)
         self._update_step_tips()
 
+    def _on_sync(self) -> None:
+        """
+        Snap the current position to the nearest beat of the fret-board grid.
+
+        The grid on the note highway is anchored at 0 with the exact BPM, so
+        the snap uses 60_000 / bpm (not the rounded step size).
+        """
+        beat = 60_000.0 / max(1, self._bpm.value())
+        pos  = self._player.position
+        snapped = int(round(pos / beat) * beat)
+        snapped = max(0, snapped)
+        dur = self._player.duration
+        if dur > 0:
+            snapped = min(snapped, dur)
+        self._player.seek(snapped)
+        self.seek_requested.emit(snapped)
+        self._lbl_pos.setText(_fmt(snapped))
+
+    def _on_volume_changed(self, volume: int) -> None:
+        """Apply the volume slider and remember it for the next session."""
+        self._player.set_volume(volume / 100.0)
+        QSettings().setValue("audio/volume", volume)
+
     # ── Slots ─────────────────────────────────────────────────────────────────
 
     def _on_pos(self, ms: int) -> None:
+        self._envelope.set_position(ms)
         if not self._seeking and not self._lbl_pos.hasFocus():
             self._seek.setValue(ms)
             self._lbl_pos.setText(_fmt(ms))
 
     def _on_dur(self, ms: int) -> None:
+        self._envelope.set_duration(ms)
         self._seek.setMaximum(ms)
         self._lbl_dur.setText(_fmt(ms))
 
@@ -304,22 +389,6 @@ class TransportBar(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_track_name(self, name: str) -> None:
-        """Show the loaded audio file name (elided when space is tight)."""
-        self._track_name = name or ""
-        self._update_track_label()
-
-    def _update_track_label(self) -> None:
-        fm = self._track_label.fontMetrics()
-        self._track_label.setText(fm.elidedText(
-            self._track_name, Qt.TextElideMode.ElideMiddle,
-            max(1, self._track_label.width())))
-        self._track_label.setToolTip(self._track_name or "Loaded audio")
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self._update_track_label()
-
     def set_timesig(self, num: int, den: int) -> None:
         """Push a complete time signature into the transport bar widgets."""
         self._ts_num.setValue(num)
@@ -328,7 +397,13 @@ class TransportBar(QWidget):
         if idx >= 0:
             self._ts_den.setCurrentIndex(idx)
 
+    def _on_slider_pressed(self) -> None:
+        self._seeking = True
+
     def _on_moved(self, value: int) -> None:
+        # Move the cursor with the drag; the envelope pans only when the
+        # cursor reaches the (narrow) follow band edge.
+        self._envelope.follow_position(value)
         if not self._lbl_pos.hasFocus():
             self._lbl_pos.setText(_fmt(value))
         self.seek_requested.emit(value)

@@ -155,8 +155,10 @@ class MainWindow(QMainWindow):
         self._audio  = AudioPlayer(self)
         self._engines: dict[str, ScriptEngine] = {}   # one engine per track slot
         self._script_path: Optional[str] = None
-        self._last_audio_dir:  str = _PROJECTS
-        self._last_script_dir: str = _PROJECTS
+        # Last-browsed folders are cached across sessions so the user does not
+        # have to re-navigate at every import / save step.
+        self._last_audio_dir:  str = self._saved_dir("folders/audio_dir", _PROJECTS)
+        self._last_script_dir: str = self._saved_dir("folders/script_dir", _PROJECTS)
         self._meta: dict = {}   # metadata parsed from / written to the .echoes header
 
         self._mp3_actions: list[QAction] = []   # toolbar + menu actions (disabled while converting)
@@ -280,26 +282,35 @@ class MainWindow(QMainWindow):
 
         hsplit.setSizes([340, 540])
         rv.addWidget(hsplit, stretch=1)
+        splitter.addWidget(right)
 
-        div_cmd = QWidget()
-        div_cmd.setFixedHeight(1)
-        div_cmd.setStyleSheet("background:#333333;")
-        rv.addWidget(div_cmd)
+        # Editor starts wide (~44 %) so the two split editors stay readable,
+        # and it absorbs extra width when the window grows.  The right pane
+        # holds only the highway/canvas (small minimums), so the editor can be
+        # dragged much wider by the user.
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 0)
+        splitter.setSizes([640, 800])
+        vbox.addWidget(splitter, stretch=1)
 
-        self._toolbox = CommandToolbox(self._audio)
-        rv.addWidget(self._toolbox, stretch=0)
-
+        # ── Full-width bottom bars: command toolbox, then transport ──────────
+        # Kept outside the right pane so their natural width (the toolbox is
+        # wide) never squeezes the script editor.
         div = QWidget()
         div.setFixedHeight(1)
         div.setStyleSheet("background:#333333;")
-        rv.addWidget(div)
+        vbox.addWidget(div)
+
+        self._toolbox = CommandToolbox(self._audio)
+        vbox.addWidget(self._toolbox, stretch=0)
+
+        div2 = QWidget()
+        div2.setFixedHeight(1)
+        div2.setStyleSheet("background:#333333;")
+        vbox.addWidget(div2)
 
         self._transport = TransportBar(self._audio)
-        rv.addWidget(self._transport, stretch=0)
-
-        splitter.addWidget(right)
-        splitter.setSizes([400, 1000])
-        vbox.addWidget(splitter, stretch=1)
+        vbox.addWidget(self._transport, stretch=0)
 
         self.statusBar().showMessage(
             "Ready  —  File › Open Audio  to load a track, "
@@ -493,8 +504,8 @@ class MainWindow(QMainWindow):
         self._editor.tracks_changed.connect(self._toolbox.set_track_names)
         # Keep note highway in sync with BPM changes
         self._transport._bpm.valueChanged.connect(
-            lambda bpm: self._highway.set_beat_ms(round(60_000 / bpm)))
-        self._highway.set_beat_ms(round(60_000 / self._transport._bpm.value()))
+            lambda bpm: self._highway.set_beat_ms(60_000 / bpm))
+        self._highway.set_beat_ms(60_000 / self._transport._bpm.value())
 
         # ── Hardware discovery (background poll of echoes.local) ─────────────
         self._device_monitor = DeviceMonitor(DEFAULT_HOSTNAME, parent=self)
@@ -940,6 +951,44 @@ class MainWindow(QMainWindow):
 
     # ── File operations ───────────────────────────────────────────────────────
 
+    @staticmethod
+    def _saved_dir(key: str, default: str) -> str:
+        """Restore a cached folder from QSettings (fallback when missing/gone)."""
+        val = QSettings().value(key, '')
+        if isinstance(val, str) and val and os.path.isdir(val):
+            return val
+        return default
+
+    def _remember_folder(self, which: str, folder: str) -> None:
+        """Cache *folder* as the last-browsed location and persist it."""
+        folder = folder or ''
+        if which == 'script':
+            self._last_script_dir = folder
+            QSettings().setValue("folders/script_dir", folder)
+        else:
+            self._last_audio_dir = folder
+            QSettings().setValue("folders/audio_dir", folder)
+
+    def _pick_path(self, title: str, start_dir: str, filters: str,
+                   save: bool = False, multi: bool = False) -> tuple:
+        """
+        Open a file dialog and remember the folder the user browsed to — even
+        when the dialog is cancelled — so the next import/save starts there.
+
+        Returns ``(ok, selected_files, browsed_dir)``.
+        """
+        dlg = QFileDialog(self, title, start_dir, filters)
+        if multi:
+            dlg.setFileMode(QFileDialog.FileMode.ExistingFiles)
+        elif save:
+            dlg.setFileMode(QFileDialog.FileMode.AnyFile)
+            dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
+        else:
+            dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        ok       = dlg.exec() == QFileDialog.DialogCode.Accepted
+        browsed  = dlg.directory().absolutePath() or start_dir
+        return ok, dlg.selectedFiles(), browsed
+
     def _new_project(self) -> None:
         """Clear all project data and start fresh (with confirmation)."""
         answer = QMessageBox.question(
@@ -970,27 +1019,32 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("New project")
 
     def _open_mp3(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Audio File", "",
+        ok, files, browsed = self._pick_path(
+            "Open Audio File", self._last_audio_dir,
             "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
         )
-        if not path:
+        self._remember_folder('audio', browsed)
+        if not ok or not files:
             return
+        path = files[0]
         self._audio.load(path)
         self._set_track_display(f"  \u266b  {os.path.basename(path)}")
         self.statusBar().showMessage(f"Loaded: {path}")
 
     def _import_tracks(self) -> None:
         """Unified import for .chart and .mid/.midi files."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import Tracks", self._last_audio_dir,
+        ok, files, browsed = self._pick_path(
+            "Import Tracks",
+            self._last_audio_dir,
             "Supported charts (*.chart *.mid *.midi)"
             ";;Clone Hero Chart (*.chart)"
             ";;MIDI Chart (*.mid *.midi)"
             ";;All Files (*)",
         )
-        if not path:
+        self._remember_folder('audio', browsed)
+        if not ok or not files:
             return
+        path = files[0]
 
         self._last_audio_dir = os.path.dirname(path)
         chart_dir = os.path.dirname(path)
@@ -1039,12 +1093,15 @@ class MainWindow(QMainWindow):
             song_meta.get('Resolution', res_default) + ' ticks/quarter-note')
 
         # ── Compute slot names for the dropdown ────────────────────────────────────
+        # Always offer the default Slot 1..6 (so gaps like "Slot 2" after a
+        # "Slot 1"+"Slot 3" project stay reachable), then any custom names.
         from ui.script_editor import MAX_TRACKS
-        existing      = self._editor.get_tracks()
+        existing       = self._editor.get_tracks()
         existing_names = list(existing.keys())
-        slot_names     = existing_names.copy()
-        for i in range(len(existing_names), MAX_TRACKS):
-            slot_names.append(f'Slot {i + 1}')
+        slot_names     = [f'Slot {i + 1}' for i in range(MAX_TRACKS)]
+        for name in existing_names:
+            if name not in slot_names:
+                slot_names.append(name)
 
         # ── Import dialog ────────────────────────────────────────────────────────────
         from ui.chart_import_dialog import ChartImportDialog
@@ -1110,14 +1167,15 @@ class MainWindow(QMainWindow):
             )
 
     def _open_mp3(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Audio File", "",
+        ok, files, browsed = self._pick_path(
+            "Open Audio File", self._last_audio_dir,
             "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
         )
-        if not path:
+        self._remember_folder('audio', browsed)
+        if not ok or not files:
             return
-        self._set_audio_files([path])
-        self.statusBar().showMessage(f"Loaded: {path}")
+        self._set_audio_files([files[0]])
+        self.statusBar().showMessage(f"Loaded: {files[0]}")
 
     def _open_audio_tracks(self) -> None:
         """
@@ -1125,17 +1183,19 @@ class MainWindow(QMainWindow):
         multi-track project. The first file is played for preview; use
         Convert to .MP3 to mix the selected tracks into a single file.
         """
-        paths, _ = QFileDialog.getOpenFileNames(
-            self, "Load Audio Tracks (up to 6)", self._last_audio_dir,
+        ok, files, browsed = self._pick_path(
+            "Load Audio Tracks (up to 6)", self._last_audio_dir,
             "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
+            multi=True,
         )
-        if not paths:
+        self._remember_folder('audio', browsed)
+        if not ok or not files:
             return
+        paths = files
         if len(paths) > 6:
             paths = paths[:6]
             self.statusBar().showMessage(
                 "Audio tracks limited to 6 \u2014 first 6 kept")
-        self._last_audio_dir = os.path.dirname(paths[0])
         self._set_audio_files(paths)
         self.statusBar().showMessage(
             "Loaded " + ", ".join(os.path.basename(p) for p in paths))
@@ -1153,9 +1213,8 @@ class MainWindow(QMainWindow):
             self._set_track_display("No file loaded")
 
     def _set_track_display(self, text: str) -> None:
-        """Update the toolbar info bar and the always-visible transport label."""
+        """Update the toolbar info bar (track name is shown on the top bar)."""
         self._info_bar.setText(text)
-        self._transport.set_track_name(text)
 
     # ── Audio → MP3 conversion ────────────────────────────────────────────────
 
@@ -1195,14 +1254,14 @@ class MainWindow(QMainWindow):
         # ── Candidate tracks: found in the project folder + loaded audio ─────
         sources = self._convert_track_sources()
         if not sources:
-            src, _ = QFileDialog.getOpenFileName(
-                self, "Select Audio File to Convert", self._last_audio_dir,
+            ok, files, browsed = self._pick_path(
+                "Select Audio File to Convert", self._last_audio_dir,
                 "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
             )
-            if not src:
+            self._remember_folder('audio', browsed)
+            if not ok or not files:
                 return
-            self._last_audio_dir = os.path.dirname(src)
-            sources = [src]
+            sources = [files[0]]
 
         # Default output name: script stem, else first track stem
         if self._script_path:
@@ -1291,12 +1350,14 @@ class MainWindow(QMainWindow):
             worker.deleteLater()
 
     def _open_script(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Project", "",
+        ok, files, browsed = self._pick_path(
+            "Open Project", self._last_script_dir,
             "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
         )
-        if not path:
+        self._remember_folder('script', browsed)
+        if not ok or not files:
             return
+        path = files[0]
         try:
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
@@ -1417,12 +1478,14 @@ class MainWindow(QMainWindow):
 
     def _import_midi(self) -> None:
         """Import a Clone Hero / Rock Band notes.mid file as an echoes script."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import MIDI Chart", self._last_audio_dir,
+        ok, files, browsed = self._pick_path(
+            "Import MIDI Chart", self._last_audio_dir,
             "MIDI Chart (*.mid *.midi);;All Files (*)",
         )
-        if not path:
+        self._remember_folder('audio', browsed)
+        if not ok or not files:
             return
+        path = files[0]
 
         try:
             with open(path, 'rb') as fh:
@@ -1543,12 +1606,14 @@ class MainWindow(QMainWindow):
             )
 
     def _open_script(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Open Script", "",
+        ok, files, browsed = self._pick_path(
+            "Open Script", self._last_script_dir,
             "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
         )
-        if not path:
+        self._remember_folder('script', browsed)
+        if not ok or not files:
             return
+        path = files[0]
         try:
             with open(path, encoding="utf-8") as fh:
                 text = fh.read()
@@ -1630,14 +1695,16 @@ class MainWindow(QMainWindow):
             self._save_script_as()
 
     def _save_script_as(self) -> None:
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save Script",
+        ok, files, browsed = self._pick_path(
+            "Save Script",
             self._script_path or self._last_script_dir,
             "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
+            save=True,
         )
-        if not path:
+        self._remember_folder('script', browsed)
+        if not ok or not files:
             return
-        self._last_script_dir = os.path.dirname(path)
+        path = files[0]
         self._script_path = path
         self._write_script(path)
         self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
@@ -1690,7 +1757,7 @@ class MainWindow(QMainWindow):
         name = self._editor.active_track_name()
         eng  = self._engines.setdefault(name, ScriptEngine())
         eng.parse(text)
-        self._highway.update_commands(eng.commands)
+        self._refresh_highway_commands()
         self._editor.set_error_lines(eng.error_line_set())
         n = len(eng.errors)
         if n:
@@ -1703,6 +1770,18 @@ class MainWindow(QMainWindow):
             c = len(eng.commands)
             self.statusBar().showMessage(
                 f"Script OK \u2014 {c} command{'s' if c != 1 else ''}")
+
+    def _refresh_highway_commands(self) -> None:
+        """
+        Feed the note highway the merged command stream of every track engine,
+        so all tracks highlight the fret board at the same time (not just the
+        selected one).
+        """
+        merged: list = []
+        for engine in self._engines.values():
+            merged.extend(engine.commands)
+        merged.sort(key=lambda c: c.time_ms)
+        self._highway.update_commands(merged)
 
     def _evaluate_all(self, pos_ms: int) -> dict:
         """Merge LED states from every track engine (later tracks override earlier)."""
@@ -1722,10 +1801,12 @@ class MainWindow(QMainWindow):
                 continue   # already up-to-date via _on_script_changed
             eng = self._engines.setdefault(name, ScriptEngine())
             eng.parse(body)
+        self._refresh_highway_commands()
 
     def _on_background_script_changed(self, track_name: str, text: str) -> None:
         """Re-parse a background track's engine when it is edited in the right editor."""
         self._engines.setdefault(track_name, ScriptEngine()).parse(text)
+        self._refresh_highway_commands()
 
     def _on_command_ready(self, line: str) -> None:
         """Route a toolbox command to the selected target slot."""
