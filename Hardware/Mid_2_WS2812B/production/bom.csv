@@ -1,0 +1,4 @@
+﻿Designator,Footprint,Quantity,Value,LCSC Part #
+"C1, C2",0805,2,100n,C49678
+TOP1,Hirose_DF13C_CL535-0404-8-51_1x04-1MP_P1.25mm_Vertical,1,Conn_01x04_Socket,C7433470
+"U1, U2",WS2812B_PTH_staggered,2,WS2812B,

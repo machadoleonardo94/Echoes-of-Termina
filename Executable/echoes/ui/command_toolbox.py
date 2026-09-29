@@ -3,9 +3,16 @@ Command Toolbox — one-row macro builder for inserting script commands.
 
 Layout (left → right):
   [ADD]  [0:05.45]  [SET/FADE/RAMP ▾]  <colour-coded parameter widgets>
+  [→ target slot]  |  MACRO  [1][2][3][4][5][6][7][8][9]
 
 The timestamp label tracks the audio position live; clicking ADD snapshots
 that instant and emits a fully-formed script line via `command_ready`.
+
+The nine numbered buttons on the right fire *macros* (see core/macros.py):
+each macro body is a block of commands plus optional `SKIP x/y` timing
+steps.  Triggering a macro emits `macro_triggered(int)`; the owner inserts
+the resulting timed lines into the target track.  Right-clicking a button
+emits `macro_edit_requested(int)` so the owner can open the editor.
 """
 from __future__ import annotations
 
@@ -16,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.audio_player  import AudioPlayer
+from core.macros       import stats
 from core.script_engine import format_ms
 
 
@@ -80,15 +88,20 @@ class _ParamWidget(QWidget):
 class CommandToolbox(QWidget):
     """
     Compact single-row command builder.
-    Emits `command_ready(str)` with a fully-formatted script line.
+    Emits `command_ready(str)` with a fully-formatted script line, plus
+    `macro_triggered(int)` / `macro_edit_requested(int)` for macro buttons.
     """
 
-    command_ready = Signal(str)
+    command_ready      = Signal(str)
+    macro_triggered    = Signal(int)   # index 1..9 — fire this macro now
+    macro_edit_requested = Signal(int) # index 1..9 — open the macro editor
+    numpad_changed     = Signal(bool)  # numpad hotkeys enabled / disabled
 
     def __init__(self, player: AudioPlayer, parent=None) -> None:
         super().__init__(parent)
         self._player = player
         self._ts_ms  = 0
+        self._macros: list[dict] = []   # filled externally via set_macros
         self._build()
         self._wire()
 
@@ -214,12 +227,128 @@ class CommandToolbox(QWidget):
         )
         row.addWidget(self._slot_combo)
 
+        # ── Macro buttons 1-9 (right end of the row) ────────────────────────
+        sep = QLabel("|")
+        sep.setStyleSheet("color:#404040; font:14px 'Segoe UI';")
+        row.addWidget(sep)
+
+        mac_lbl = QLabel("MACRO")
+        mac_lbl.setStyleSheet(
+            "color:#b58900; font:bold 9px 'Segoe UI'; margin:0 2px;")
+        mac_lbl.setToolTip(
+            "Macro buttons \u2014 insert a stored block of commands at the\n"
+            "current time.  SKIP x/y lines spread the commands across the\n"
+            "bar grid.  Hotkeys: 1-9 (not while editing text).\n"
+            "Right-click a button to edit its macro.")
+        row.addWidget(mac_lbl)
+
+        self._macro_btns: list[QPushButton] = []
+        for i in range(1, 10):
+            b = QPushButton(str(i))
+            b.setFixedSize(24, 24)
+            b.setCursor(Qt.CursorShape.PointingHandCursor)
+            b.setContextMenuPolicy(
+                Qt.ContextMenuPolicy.CustomContextMenu)
+            b.customContextMenuRequested.connect(
+                lambda _pos, n=i: self.macro_edit_requested.emit(n))
+            b.setToolTip(self._macro_tooltip(i, None))
+            self._apply_macro_style(b, has_content=False)
+            row.addWidget(b)
+            self._macro_btns.append(b)
+
+        # ── Numpad toggle — main-row 1-9 always fire; numpad 1-9 only when on
+        self._btn_num = QPushButton("NUM")
+        self._btn_num.setCheckable(True)
+        self._btn_num.setChecked(True)
+        self._btn_num.setFixedSize(40, 24)
+        self._btn_num.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._btn_num.setToolTip(
+            "Numpad macro hotkeys\n"
+            "ON  — the numpad digit keys 1-9 also fire macros\n"
+            "OFF — only the main-row 1-9 keys fire macros\n"
+            "(never while typing in a text field)")
+        self._apply_num_style(True)
+        row.addSpacing(4)
+        row.addWidget(self._btn_num)
+        self._btn_num.toggled.connect(self._on_num_toggled)
+
+    # ── Numpad toggle helpers ────────────────────────────────────────────────
+
+    def _apply_num_style(self, on: bool) -> None:
+        """Blue highlight while numpad hotkeys are on, neutral when off."""
+        if on:
+            style = (
+                "QPushButton { background:#0e639c; color:#ffffff; "
+                "border:1px solid #1177bb; border-radius:3px; "
+                "font:bold 9px 'Segoe UI'; padding:0; }"
+                "QPushButton:hover { background:#1177bb; }"
+                "QPushButton:pressed { background:#0a4f7a; }"
+            )
+        else:
+            style = (
+                "QPushButton { background:#262626; color:#888888; "
+                "border:1px solid #3f3f46; border-radius:3px; "
+                "font:bold 9px 'Segoe UI'; padding:0; }"
+                "QPushButton:hover { background:#3a3a3a; color:#cccccc; }"
+                "QPushButton:pressed { background:#161616; }"
+            )
+        self._btn_num.setStyleSheet(style)
+
+    def _on_num_toggled(self, on: bool) -> None:
+        self._apply_num_style(on)
+        self.numpad_changed.emit(on)
+
+    # ── Macro button helpers ────────────────────────────────────────────────
+
+    @staticmethod
+    def _macro_tooltip(index: int, macro: dict | None) -> str:
+        """Tooltip for macro button *index* (1-9) given its stored dict."""
+        head = f"Macro {index}"
+        if not macro:
+            return (f"{head} \u2014 empty\nRight-click to edit \u00b7 "
+                    f"hotkey: {index}")
+        name = (macro.get('name') or '').strip()
+        body = (macro.get('content') or '').strip()
+        if name and name != f"Macro {index}":
+            head += f"  \u2014  {name}"
+        parts = [head]
+        lines = [ln.strip() for ln in body.splitlines()
+                 if ln.strip() and not ln.strip().startswith('#')]
+        for ln in lines[:3]:
+            parts.append("    " + ln)
+        if len(lines) > 3:
+            parts.append(f"    \u2026 +{len(lines) - 3} more")
+        n_cmd, n_skip = stats(body)
+        parts.append(f"{n_cmd} command{'s' if n_cmd != 1 else ''}"
+                     f" \u00b7 {n_skip} skip{'s' if n_skip != 1 else ''}"
+                     f"  \u00b7 hotkey: {index}  \u00b7 "
+                     f"right-click to edit")
+        return "\n".join(parts)
+
+    @staticmethod
+    def _apply_macro_style(btn: QPushButton, has_content: bool) -> None:
+        """Number styling: amber when the macro has content, grey when empty."""
+        if has_content:
+            base, hover, border = "#b58900", "#d7a92e", "#d7a92e"
+        else:
+            base, hover, border = "#6a6a6a", "#9a9a9a", "#555555"
+        btn.setStyleSheet(
+            f"QPushButton {{ background:#262626; color:{base}; "
+            f"border:1px solid {border}; border-radius:3px; "
+            f"font:bold 10px 'Consolas'; padding:0; }}"
+            f"QPushButton:hover {{ background:#3a3a3a; color:{hover}; "
+            f"border-color:{border}; }}"
+            f"QPushButton:pressed {{ background:#161616; }}"
+        )
+
     # ── Wiring ────────────────────────────────────────────────────────────────
 
     def _wire(self) -> None:
         self._player.position_changed.connect(self._on_position)
         self._cmd_combo.currentIndexChanged.connect(self._stack.setCurrentIndex)
         self._btn_add.clicked.connect(self._on_add)
+        for i, btn in enumerate(self._macro_btns, start=1):
+            btn.clicked.connect(lambda _=False, n=i: self.macro_triggered.emit(n))
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
@@ -275,3 +404,28 @@ class CommandToolbox(QWidget):
     def current_target_track(self) -> str:
         """Return the currently selected target slot name."""
         return self._slot_combo.currentText()
+
+    def set_macros(self, macros: list[dict]) -> None:
+        """
+        Refresh the nine macro buttons from *macros* (a list of dicts with
+        'name' and 'content' keys, length 1-9).  Buttons with content get an
+        amber number + a tooltip preview; empty ones are dimmed.
+        """
+        self._macros = list(macros) if macros else []
+        for i, btn in enumerate(self._macro_btns):
+            macro = (self._macros[i]
+                     if i < len(self._macros) else None)
+            body   = (macro or {}).get('content') or ''
+            has    = bool(str(body).strip())
+            btn.setToolTip(self._macro_tooltip(i + 1, macro))
+            self._apply_macro_style(btn, has_content=has)
+
+    def set_numpad_enabled(self, on: bool) -> None:
+        """Sync the NUM toggle from outside (no signal re-emitted)."""
+        self._btn_num.blockSignals(True)
+        self._btn_num.setChecked(bool(on))
+        self._btn_num.blockSignals(False)
+        self._apply_num_style(bool(on))
+
+    def numpad_enabled(self) -> bool:
+        return self._btn_num.isChecked()

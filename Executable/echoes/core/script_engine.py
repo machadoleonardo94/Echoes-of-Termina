@@ -31,6 +31,7 @@ Comments: anything after '#' on a line is ignored.
 """
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 
@@ -413,6 +414,42 @@ class ScriptEngine:
             else:
                 break
         return line
+
+    def active_lines_at(self, position_ms: int) -> tuple:
+        """
+        Return ``(trigger_line, sustaining_lines)`` for *position_ms*.
+
+        ``trigger_line`` is the 1-based line of the most recent command that
+        has fired (or -1).  ``sustaining_lines`` is the set of 1-based lines
+        whose effect is still "sounding" at this position:
+
+          • RAMP  — while the position is inside the ramp window
+            [time_ms, time_ms + duration_ms);
+          • FADE  — while its exponential decay is still above ~1/255 of the
+            starting brightness (the visible tail before it reaches black).
+
+        SET commands are only highlighted at their trigger instant (they hold
+        until overwritten, so treating them as sustained would pile up).
+        """
+        trigger = -1
+        sustaining: set[int] = set()
+        for cmd in self.commands:
+            if cmd.time_ms > position_ms:
+                break
+            trigger = cmd.line_number
+            if isinstance(cmd, RampCommand):
+                if position_ms < cmd.time_ms + cmd.duration_ms:
+                    sustaining.add(cmd.line_number)
+            elif isinstance(cmd, FadeCommand):
+                rate = (100 - cmd.percent) / 100.0
+                v0   = max(cmd.r, cmd.g, cmd.b)
+                if rate > 0 and v0 > 0:
+                    # value(t) = v0 * rate**t  →  drops below 1 at
+                    # t = ln(1/v0) / ln(rate)   (rate, v0 > 0)
+                    tail_s = math.log(1.0 / v0) / math.log(rate)
+                    if tail_s > 0 and position_ms - cmd.time_ms < tail_s * 1000:
+                        sustaining.add(cmd.line_number)
+        return trigger, sustaining
 
     def error_line_set(self) -> set:
         """Return the set of 1-based line numbers that produced parse errors."""

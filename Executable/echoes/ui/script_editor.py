@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore  import Qt, QRect, QSize, QTimer, Signal
+from PySide6.QtCore  import Qt, QPoint, QRect, QSize, QTimer, Signal
 from PySide6.QtGui   import (
     QColor, QFont, QPainter, QTextCharFormat, QTextCursor,
     QTextDocument, QTextFormat, QSyntaxHighlighter,
@@ -153,8 +153,9 @@ class ScriptEditor(QPlainTextEdit):
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
 
-        self._gutter      = _LineNumberArea(self)
-        self._active_line = -1          # 1-based; −1 = none
+        self._gutter           = _LineNumberArea(self)
+        self._active_line      = -1        # 1-based trigger line; −1 = none
+        self._sustaining_lines: set[int] = set()   # lines still sounding
         self._error_lines: set[int] = set()
 
         # Monospace font
@@ -183,10 +184,65 @@ class ScriptEditor(QPlainTextEdit):
 
     def set_active_line(self, line: int) -> None:
         """Highlight *line* (1-based) as the current playhead command."""
-        if self._active_line != line:
-            self._active_line = line
-            self._gutter.update()
-            self._refresh_extras()
+        self.set_active_lines(line, set())
+
+    def set_active_lines(self, trigger: int,
+                         sustaining: set | None = None) -> None:
+        """
+        Highlight the notes currently being played:
+          *trigger*      — 1-based line of the command that just fired
+                           (bright highlight, bold gutter number);
+          *sustaining*   — 1-based lines whose effect is still sounding
+                           (RAMP within its window, FADE in its visible
+                           tail) — drawn with a softer highlight.
+        """
+        sustaining = set(sustaining or ())
+        if self._active_line == trigger and self._sustaining_lines == sustaining:
+            return
+        self._active_line      = trigger
+        self._sustaining_lines = sustaining
+        self._gutter.update()
+        self._refresh_extras()
+
+    def follow_active_line(self) -> None:
+        """
+        Scroll the editor so the current (trigger) line stays visible while
+        the audio plays — like the transport bar follows the playhead.  The
+        active line is pinned to an anchor a quarter of the way down the
+        viewport so upcoming notes scroll in below it and the text moves in
+        step with the clock.
+
+        UNIT WARNING — the editor mixes two coordinate spaces:
+
+          • ``blockBoundingGeometry()`` / ``cursorRect()`` are in PIXELS;
+          • the vertical scroll bar of a QPlainTextEdit counts BLOCKS (its
+            value is the index of the first visible block, so a 200-line
+            script has a range of 0 … 200 − visible lines, not 0 … pixels).
+
+        Adding a pixel delta to the bar value therefore throws the view to
+        whichever end of the document the (huge) number clamps to, and the
+        next tick throws it back — the view visibly ping-pongs between the
+        first and the last lines instead of following the playhead.  The
+        anchor is translated from pixels to a block index with Qt's own hit
+        test, and the bar is moved in whole blocks.
+        """
+        if self._active_line <= 0:
+            return
+        target = self._active_line - 1              # 0-based block number
+        if not self.document().findBlockByNumber(target).isValid():
+            return
+
+        bar = self.verticalScrollBar()
+        if bar.maximum() <= bar.minimum():
+            return                                  # the script already fits
+
+        anchor_y = int(self.viewport().height() * 0.25)
+        here     = self.cursorForPosition(QPoint(0, anchor_y)).blockNumber()
+        delta    = target - here                    # whole blocks
+        if delta == 0:
+            return                                  # already on the anchor
+        bar.setValue(max(bar.minimum(),
+                         min(bar.value() + delta, bar.maximum())))
 
     def set_error_lines(self, lines: set) -> None:
         """Highlight the given 1-based line numbers as parse errors."""
@@ -248,6 +304,66 @@ class ScriptEditor(QPlainTextEdit):
         self.setTextCursor(cursor)
         self.ensureCursorVisible()
 
+    def insert_command_lines(self, lines: list[str]) -> None:
+        """
+        Insert *lines* as ONE contiguous block in timestamp order.
+
+        The insertion point is located from the run's LAST line: the whole
+        run goes before the first existing block whose timestamp is greater
+        than the run's latest timestamp (or is appended at the end).  A macro
+        run therefore stays grouped and readable at its chronological
+        position; firing the same macro again stacks a second run right after
+        the first instead of interleaving duplicate lines.  Only one
+        script_changed debounce fires for the whole run.
+        """
+        from core.script_engine import _parse_timestamp
+
+        lines = [ln for ln in lines if ln.strip()]
+        if not lines:
+            return
+
+        tokens    = lines[-1].split()          # anchor on the run's LAST line
+        anchor_ms = _parse_timestamp(tokens[0]) if tokens else None
+        body      = '\n'.join(lines)   # no trailing newline yet
+
+        doc = self.document()
+        n   = doc.blockCount()
+
+        insert_before = n   # default: append
+        if anchor_ms is not None:
+            for i in range(n):
+                txt = doc.findBlockByNumber(i).text().strip()
+                if not txt or txt.startswith('#'):
+                    continue
+                toks = txt.split()
+                ts = _parse_timestamp(toks[0]) if toks else None
+                if ts is not None and ts > anchor_ms:
+                    insert_before = i
+                    break
+
+        cursor = QTextCursor(doc)
+        if insert_before < n:
+            blk = doc.findBlockByNumber(insert_before)
+            cursor.setPosition(blk.position())
+            cursor.insertText(body + '\n')
+            first_block_num = insert_before
+        else:
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            last_text = doc.findBlockByNumber(n - 1).text()
+            if last_text.strip():
+                cursor.insertText('\n')
+            cursor.insertText(body)
+            # The run starts a fresh block; index it from the final count.
+            first_block_num = doc.blockCount() - len(lines)
+
+        # Put the caret at the START of the inserted run (not the end) so the
+        # user immediately sees the whole macro block from its first line.
+        first = doc.findBlockByNumber(first_block_num)
+        cur   = QTextCursor(first)
+        cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        self.setTextCursor(cur)
+        self.ensureCursorVisible()
+
     # ── Extra selections ─────────────────────────────────────────────────────
 
     def _refresh_extras(self) -> None:
@@ -270,6 +386,15 @@ class ScriptEditor(QPlainTextEdit):
             s.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
             return s
 
+        # ── Sustaining lines  —  notes still sounding (RAMP window / FADE
+        # tail): softer highlight so the current trigger stands out.
+        for ln in self._sustaining_lines:
+            if ln == self._active_line:
+                continue
+            sel = _make(ln - 1, bg=QColor("#143c31"))
+            if sel:
+                sels.append(sel)
+
         # ── Active playhead line  —  bright, easy to follow while playing
         if self._active_line > 0:
             sel = _make(
@@ -282,7 +407,7 @@ class ScriptEditor(QPlainTextEdit):
 
         # ── Error lines  —  subtle red, only for non-active lines
         for ln in self._error_lines:
-            if ln != self._active_line:
+            if ln != self._active_line and ln not in self._sustaining_lines:
                 sel = _make(ln - 1, bg=QColor("#4a1515"))
                 if sel:
                     sels.append(sel)
@@ -383,6 +508,46 @@ def _insert_line_into_text(text: str, new_line: str) -> str:
     return ''.join(lines)
 
 
+def _insert_lines_into_text(text: str, lines: list[str]) -> str:
+    """
+    Insert *lines* as one contiguous, timestamp-ordered block into *text*.
+    Batch counterpart of ``_insert_line_into_text`` for hidden tracks.  The
+    insertion point is anchored on the run's LAST line, so the whole macro
+    block lands before the first existing line that is later than the run's
+    end (or is appended), keeping the run grouped and readable.
+    """
+    from core.script_engine import _parse_timestamp
+
+    lines = [ln for ln in lines if ln.strip()]
+    if not lines:
+        return text
+
+    tokens    = lines[-1].split()          # anchor on the run's LAST line
+    anchor_ms = _parse_timestamp(tokens[0]) if tokens else None
+    block     = '\n'.join(lines)
+
+    out = text.splitlines(keepends=True)
+    if out and not out[-1].endswith('\n'):
+        out[-1] += '\n'
+
+    if anchor_ms is None:
+        return text.rstrip('\n') + '\n' + block + '\n'
+
+    insert_before = len(out)
+    for i, raw in enumerate(out):
+        stripped = raw.split('#', 1)[0].strip()
+        if not stripped:
+            continue
+        toks = stripped.split()
+        ts = _parse_timestamp(toks[0]) if toks else None
+        if ts is not None and ts > anchor_ms:
+            insert_before = i
+            break
+
+    out.insert(insert_before, block + '\n')
+    return ''.join(out)
+
+
 # ── Multi-track editor panel ───────────────────────────────────────────
 
 MAX_TRACKS = 6   # maximum number of track slots per project──────
@@ -400,9 +565,12 @@ class MultiTrackEditorWidget(QWidget):
     Public API (mirrors the ScriptEditor subset used by MainWindow):
         set_tracks(dict[str, str])   — load all tracks, rebuild dropdowns
         get_tracks() -> dict         — return all tracks with live editor text
-        set_active_line(int)         — forward to left editor
-        set_error_lines(set)         — forward to left editor
+        set_active_line(int)     — forward to left editor
+        set_active_lines(int,set)— playing-note highlights to left editor
+        follow_active_line()     — scroll left editor with the playhead
+        set_error_lines(set)     — forward to left editor
         insert_command_line(str)     — insert into focused editor (default left)
+        insert_command_lines(list)   — batch insert (one contiguous block)
         setPlaceholderText(str)      — forward to left editor
 
     Signal:
@@ -567,7 +735,16 @@ class MultiTrackEditorWidget(QWidget):
         return self._left_track
 
     def set_active_line(self, line: int) -> None:
-        self._left_editor.set_active_line(line)
+        self.set_active_lines(line, set())
+
+    def set_active_lines(self, trigger: int,
+                         sustaining: set | None = None) -> None:
+        """Forward the playing-note highlight to the left editor."""
+        self._left_editor.set_active_lines(trigger, sustaining)
+
+    def follow_active_line(self) -> None:
+        """Keep the currently playing note visible in the left editor."""
+        self._left_editor.follow_active_line()
 
     def set_error_lines(self, lines: set) -> None:
         self._left_editor.set_error_lines(lines)
@@ -594,6 +771,28 @@ class MultiTrackEditorWidget(QWidget):
         elif track_name in self._tracks:
             self._tracks[track_name] = _insert_line_into_text(
                 self._tracks[track_name], line)
+
+    def insert_command_lines(self, lines: list[str]) -> None:
+        """Insert *lines* as one contiguous block into the focused editor."""
+        if self._right_editor.isVisible() and self._right_editor.hasFocus():
+            self._right_editor.insert_command_lines(lines)
+        else:
+            self._left_editor.insert_command_lines(lines)
+
+    def insert_command_lines_to(self, track_name: str, lines: list[str]) -> None:
+        """
+        Insert *lines* as one contiguous, timestamp-ordered block into a
+        specific track slot (batch counterpart of ``insert_command_line_to``).
+        """
+        if not lines:
+            return
+        if track_name == self._left_track:
+            self._left_editor.insert_command_lines(lines)
+        elif track_name == self._right_track and self._right_editor.isVisible():
+            self._right_editor.insert_command_lines(lines)
+        elif track_name in self._tracks:
+            self._tracks[track_name] = _insert_lines_into_text(
+                self._tracks[track_name], lines)
 
     def setPlaceholderText(self, text: str) -> None:  # noqa: N802
         self._left_editor.setPlaceholderText(text)

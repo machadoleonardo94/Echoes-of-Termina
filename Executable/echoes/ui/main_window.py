@@ -23,10 +23,10 @@ import os
 import re
 from typing import Optional
 
-from PySide6.QtCore    import QObject, QSettings, Qt, QSize
-from PySide6.QtGui     import QAction, QCursor, QTextCursor
+from PySide6.QtCore    import QEvent, QObject, QSettings, Qt, QSize
+from PySide6.QtGui     import QAction, QCursor, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
-    QCheckBox, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
+    QCheckBox, QDialog, QFileDialog, QHBoxLayout, QLabel, QMainWindow, QMenu,
     QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSplitter,
     QToolBar, QVBoxLayout, QWidget,
 )
@@ -35,6 +35,7 @@ from core.audio_converter import (
     Mp3ConvertWorker, ffmpeg_available, find_audio_files,
 )
 from core.audio_player  import AudioPlayer
+from core import macros as macro_store
 from core.device_discovery import DEFAULT_HOSTNAME, DeviceMonitor, probe_device
 from core.device_media import (
     DeviceStatusPoller, ProjectUploadWorker, device_url, ensure_dir, fetch_dir,
@@ -106,10 +107,31 @@ def _parse_song_ini(path: str) -> dict:
 from ui.command_toolbox  import CommandToolbox
 from ui.device_browser_dialog import DeviceBrowserDialog
 from ui.led_canvas       import LEDCanvas
+from ui.macro_dialog     import MacroEditorDialog
 from ui.metadata_dialog  import MetadataDialog
 from ui.note_highway     import NoteHighway
 from ui.script_editor    import MultiTrackEditorWidget, ScriptEditor
 from ui.transport_bar    import TransportBar
+
+# Digit keys 1-9 → macro index.  Numpad digits arrive as the same key codes
+# as the top row plus the KeypadModifier, so one map covers both top-row and
+# numpad keys.
+_DIGIT_KEYS = {getattr(Qt, f"Key_{n}"): n for n in range(1, 10)}
+
+# With NumLock OFF the numpad digit keys report as navigation keys (still
+# carrying the KeypadModifier).  Map them back to the digit printed on the
+# keycap so the numpad hotkeys work regardless of the NumLock state.
+_NUMPAD_NAV_DIGITS = {
+    Qt.Key_End:      1,
+    Qt.Key_Down:     2,
+    Qt.Key_PageDown: 3,
+    Qt.Key_Left:     4,
+    Qt.Key_Clear:    5,
+    Qt.Key_Right:    6,
+    Qt.Key_Home:     7,
+    Qt.Key_Up:       8,
+    Qt.Key_PageUp:   9,
+}
 
 
 # ── Upload worker lifetime ────────────────────────────────────────────────────
@@ -160,6 +182,11 @@ class MainWindow(QMainWindow):
         self._last_audio_dir:  str = self._saved_dir("folders/audio_dir", _PROJECTS)
         self._last_script_dir: str = self._saved_dir("folders/script_dir", _PROJECTS)
         self._meta: dict = {}   # metadata parsed from / written to the .echoes header
+        self._macros: list[dict] = macro_store.load_macros()   # toolbox macros 1-9
+        # Numpad digit keys may optionally fire macros too (persisted; the
+        # main-row 1-9 keys always fire — unless the user is editing text).
+        self._use_numpad: bool = bool(
+            QSettings().value("macros/use_numpad", True, type=bool))
 
         self._mp3_actions: list[QAction] = []   # toolbar + menu actions (disabled while converting)
         self._mp3_worker: Optional[Mp3ConvertWorker] = None
@@ -481,6 +508,16 @@ class MainWindow(QMainWindow):
         # ── Tools: less-frequent utilities live here, not the toolbar ───────
         tm = mb.addMenu("&Tools")
         self._act(tm, "&Convert Hardware Version\u2026", "", self._convert_hw_version)
+        tm.addSeparator()
+        self._numpad_action = QAction("Numpad &Macro Hotkeys (1-9)", self)
+        self._numpad_action.setCheckable(True)
+        self._numpad_action.setChecked(self._use_numpad)
+        self._numpad_action.setToolTip(
+            "Let the numpad digit keys 1-9 fire macros as well as the\n"
+            "main-row 1-9 keys.  Disable if the numpad is used for\n"
+            "something else.  (Neither ever fires while editing text.)")
+        self._numpad_action.toggled.connect(self._on_numpad_changed)
+        tm.addAction(self._numpad_action)
 
     def _act(self, menu, label: str, shortcut: str, slot) -> QAction:
         a = QAction(label, self)
@@ -501,11 +538,43 @@ class MainWindow(QMainWindow):
         self._transport.seek_requested.connect(self._on_seek)
         self._canvas.zone_right_clicked.connect(self._on_zone_right_clicked)
         self._toolbox.command_ready.connect(self._on_command_ready)
+        self._toolbox.macro_triggered.connect(self._on_macro_triggered)
+        self._toolbox.macro_edit_requested.connect(self._on_macro_edit)
+        self._toolbox.numpad_changed.connect(self._on_numpad_changed)
         self._editor.tracks_changed.connect(self._toolbox.set_track_names)
         # Keep note highway in sync with BPM changes
         self._transport._bpm.valueChanged.connect(
             lambda bpm: self._highway.set_beat_ms(60_000 / bpm))
         self._highway.set_beat_ms(60_000 / self._transport._bpm.value())
+
+        # Populate the nine macro buttons; global digit hotkeys 1-9 fire them
+        # unless the user is editing text (see eventFilter below).
+        self._toolbox.set_macros(self._macros)
+        self._toolbox.set_numpad_enabled(self._use_numpad)
+        self.installEventFilter(self)
+
+        # Left/Right arrows = transport nudges by ONE grid slice (one Y-th of
+        # a beat — the time-signature subdivision grid).  Registered as window
+        # shortcuts so they work from any focused control; Qt suppresses them
+        # automatically while the user is editing text (script editor, line
+        # edits, spin boxes).
+        self._nudge_back = QAction("Step back (grid slice)", self)
+        self._nudge_back.setShortcut(QKeySequence(Qt.Key_Left))
+        self._nudge_back.setToolTip(
+            "Step the playhead back by one grid slice (1/Y beat —\n"
+            "see the transport time-signature grid, e.g. 1/6 in 4/6)")
+        self._nudge_back.triggered.connect(
+            lambda: self._transport.nudge(back=True))
+        self.addAction(self._nudge_back)
+
+        self._nudge_fwd = QAction("Step forward (grid slice)", self)
+        self._nudge_fwd.setShortcut(QKeySequence(Qt.Key_Right))
+        self._nudge_fwd.setToolTip(
+            "Step the playhead forward by one grid slice (1/Y beat);\n"
+            "while paused this auditions that slice of the audio")
+        self._nudge_fwd.triggered.connect(
+            lambda: self._transport.nudge(back=False))
+        self.addAction(self._nudge_fwd)
 
         # ── Hardware discovery (background poll of echoes.local) ─────────────
         self._device_monitor = DeviceMonitor(DEFAULT_HOSTNAME, parent=self)
@@ -1736,22 +1805,32 @@ class MainWindow(QMainWindow):
     # ── Runtime slots ─────────────────────────────────────────────────────────
 
     def _on_position(self, pos_ms: int) -> None:
-        eng = self._engines.get(self._editor.active_track_name())
-        if eng:
-            self._editor.set_active_line(eng.get_active_line_at(pos_ms))
+        self._mark_playing_lines(pos_ms, follow=True)
         states = self._evaluate_all(pos_ms)
         self._canvas.update_leds(states)
         self._highway.update_position(pos_ms)
         self._highway.update_leds(states)
 
     def _on_seek(self, pos_ms: int) -> None:
-        eng = self._engines.get(self._editor.active_track_name())
-        if eng:
-            self._editor.set_active_line(eng.get_active_line_at(pos_ms))
+        self._mark_playing_lines(pos_ms, follow=False)
         states = self._evaluate_all(pos_ms)
         self._canvas.update_leds(states)
         self._highway.update_position(pos_ms)
         self._highway.update_leds(states)
+
+    def _mark_playing_lines(self, pos_ms: int, follow: bool) -> None:
+        """
+        Highlight the notes currently being played in the editor and, while
+        the audio plays, scroll the editor so the active line stays in view
+        (mirroring how the transport follows the playhead).
+        """
+        eng = self._engines.get(self._editor.active_track_name())
+        if not eng:
+            return
+        trigger, sustaining = eng.active_lines_at(pos_ms)
+        self._editor.set_active_lines(trigger, sustaining)
+        if follow and self._audio.is_playing:
+            self._editor.follow_active_line()
 
     def _on_script_changed(self, text: str) -> None:
         name = self._editor.active_track_name()
@@ -1810,11 +1889,140 @@ class MainWindow(QMainWindow):
 
     def _on_command_ready(self, line: str) -> None:
         """Route a toolbox command to the selected target slot."""
+        self._deliver_lines([line])
+
+    def _deliver_lines(self, lines: list[str]) -> None:
+        """Insert formatted script lines, honouring the toolbox target slot."""
+        if not lines:
+            return
         target = self._toolbox.current_target_track()
-        if target:
-            self._editor.insert_command_line_to(target, line)
+        if len(lines) == 1:
+            # Single lines (plain ADD) keep the classic per-line insertion.
+            line = lines[0]
+            if target:
+                self._editor.insert_command_line_to(target, line)
+            else:
+                self._editor.insert_command_line(line)
         else:
-            self._editor.insert_command_line(line)
+            # A macro run is written as ONE contiguous, ordered block so the
+            # lines stay grouped and readable at their timestamp position.
+            if target:
+                self._editor.insert_command_lines_to(target, lines)
+            else:
+                self._editor.insert_command_lines(lines)
+
+    # ── Macro buttons + digit hotkeys 1-9 ────────────────────────────────────
+
+    def _on_macro_triggered(self, index: int) -> None:
+        self._trigger_macro(index)
+
+    def _trigger_macro(self, index: int) -> None:
+        """
+        Fire macro *index* (1-9): expand its body into timed commands and add
+        them to the current track at the current playback position, exactly
+        like ADD — the first command lands at the playhead and every
+        ``SKIP x/y`` line moves the following commands forward by x/y of a
+        bar (BPM + time signature from the transport bar).
+        """
+        if not (1 <= index <= len(self._macros)):
+            return
+        body  = (self._macros[index - 1] or {}).get('content') or ''
+        steps = list(macro_store.iter_steps(body))
+        if not steps:
+            self.statusBar().showMessage(
+                f"Macro {index} is empty — right-click its button to edit")
+            return
+        if not any(s[0] == 'cmd' for s in steps):
+            self.statusBar().showMessage(
+                f"Macro {index} contains skip steps only — nothing to insert")
+            return
+
+        start   = self._audio.position
+        inserts = macro_store.plan_insertions(
+            steps, start, self._transport.bar_ms())
+        # Quantise every macro command to the subdivision grid (the time
+        # signature's slices per beat) so placed effects land on-grid.
+        lines = [f"{format_ms(self._transport.snap(t))} {text}"
+                 for t, text in inserts]
+
+        self._deliver_lines(lines)
+        n = len(lines)
+        self.statusBar().showMessage(
+            f"Macro {index}: {n} command{'s' if n != 1 else ''} added "
+            f"at {format_ms(start)}")
+
+    def _on_macro_edit(self, index: int) -> None:
+        """Open the editor dialog for macro *index* and persist the result."""
+        if not (1 <= index <= len(self._macros)):
+            return
+        cur = self._macros[index - 1] or {}
+        dlg = MacroEditorDialog(index,
+                                cur.get('name', ''),
+                                cur.get('content', ''),
+                                self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, content = dlg.macro()
+        self._macros[index - 1] = {"name": name, "content": content}
+        self._toolbox.set_macros(self._macros)
+        ok = macro_store.save_macros(self._macros)
+        self.statusBar().showMessage(
+            f"Macro {index} updated"
+            + ("" if ok else "  (could not write ~/.echoes/macros.json)"))
+
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        """
+        Global macro hotkeys: the digit keys 1-9 fire the matching macro
+        button.  The top row fires always; numpad digits only while the NUM
+        toggle is on (NumLock OFF numpad keys are mapped from their
+        navigation codes).  Keys are never intercepted while the user is
+        editing text (script editors, line edits, spin boxes, combo boxes)
+        nor inside another top-level window (open dialogs).
+
+        (Left/Right arrow transport nudges are handled by window shortcuts,
+        not here — see _wire.)
+        """
+        if (event.type() == QEvent.Type.KeyPress
+                and not event.isAutoRepeat()
+                and obj.window() is self
+                and not self._focus_is_typing()):
+            mods = event.modifiers()
+            if mods == Qt.KeyboardModifier.NoModifier:
+                n = _DIGIT_KEYS.get(event.key())
+                if n:
+                    self._trigger_macro(n)            # main-row 1-9
+                    return True
+            elif mods == Qt.KeyboardModifier.KeypadModifier:
+                n = (_DIGIT_KEYS.get(event.key())
+                     or _NUMPAD_NAV_DIGITS.get(event.key()))
+                if n and self._use_numpad:
+                    self._trigger_macro(n)            # numpad digits
+                    return True
+        return super().eventFilter(obj, event)
+
+    def _on_numpad_changed(self, on: bool) -> None:
+        """Persist the numpad-hotkey preference and keep all controls in sync."""
+        self._use_numpad = bool(on)
+        QSettings().setValue("macros/use_numpad", self._use_numpad)
+        self._toolbox.set_numpad_enabled(self._use_numpad)
+        act = getattr(self, '_numpad_action', None)
+        if act is not None:
+            act.setChecked(self._use_numpad)   # no-op when unchanged
+        self.statusBar().showMessage(
+            "Numpad keys 1-9 fire macros"
+            if self._use_numpad else
+            "Numpad keys disabled — only the main-row 1-9 fire macros")
+
+    @staticmethod
+    def _focus_is_typing() -> bool:
+        """True when the focused widget consumes typed text / digits."""
+        from PySide6.QtWidgets import (
+            QAbstractSpinBox, QApplication, QComboBox, QLineEdit,
+            QPlainTextEdit, QTextEdit,
+        )
+        w = QApplication.focusWidget()
+        return isinstance(w, (QLineEdit, QPlainTextEdit, QTextEdit,
+                              QAbstractSpinBox, QComboBox))
 
     def _on_duration(self, ms: int) -> None:
         """Keep _meta duration in sync whenever audio is (re)loaded."""

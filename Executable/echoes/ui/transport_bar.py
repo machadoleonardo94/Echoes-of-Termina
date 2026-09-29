@@ -1,13 +1,28 @@
 """
 Three-row audio transport bar:
-  ⏹  ⏮ ⏭  ▶  ⊙   🔊 ─●──  BPM [___]  [4/4]   ← controls (⊙ = Sync)
-  0:15.50  ─────●──────  3:45.00             ← time · progress · end time
+  ⏹  ⏮ ⏭  ▶  ⊙   🔊 ─●──  BPM [___]  [X/Y]   ← controls (⊙ = Sync)
+  0:15.50  ─────●──────  3:45.00               ← time · progress · end time
   ══ audio envelope (drag grip to collapse/stretch) ══
+
+Grid model
+──────────
+The time signature is read as  X/Y  =  X beats per bar, each beat divided
+into Y equal GRID SLICES (a subdivision grid).  Y is editable, so triplet /
+sextuplet / 12-tuplet grids are possible (e.g. 4/6 → 4 beats per bar with
+six slices per beat, 8/12 → eight beats with twelve slices per beat).
+
+  beat  = 60 000 / BPM ms          bar = X × beat
+  slice = beat / Y
+
+Everything snaps to the grid: the step buttons move by whole slices
+(1×, 2×, 3×, 4× a slice), the ←/→ arrow keys nudge by one slice, Sync snaps
+to the nearest slice and macro SKIP steps are quantised to the slice grid.
 """
 from __future__ import annotations
 
 from PySide6.QtCore    import QPointF, QRectF, Qt, QSettings, QTimer, Signal
-from PySide6.QtGui     import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui     import (QBrush, QColor, QIcon, QIntValidator, QPainter,
+                                QPen, QPixmap)
 from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit,
                                 QPushButton, QSlider, QSpinBox, QVBoxLayout,
                                 QWidget)
@@ -74,27 +89,79 @@ _VOL_GROOVE = """
     QSlider::handle:horizontal:hover { background: #aaaaaa; }
 """
 
+# Unicode fraction glyphs used on step buttons where a clean glyph exists;
+# anything else falls back to plain "a/b" text.
+_FRACTION_GLYPHS = {
+    (1, 2):  '\u00bd',   # ½
+    (1, 3):  '\u2153',   # ⅓
+    (2, 3):  '\u2154',   # ⅔
+    (1, 4):  '\u00bc',   # ¼
+    (3, 4):  '\u00be',   # ¾
+    (1, 5):  '\u2155',   # ⅕
+    (2, 5):  '\u2156',   # ⅖
+    (3, 5):  '\u2157',   # ⅗
+    (4, 5):  '\u2158',   # ⅘
+    (1, 6):  '\u2159',   # ⅙
+    (5, 6):  '\u215A',   # ⅚
+    (1, 8):  '\u215B',   # ⅛
+    (3, 8):  '\u215C',   # ⅜
+    (5, 8):  '\u215D',   # ⅝
+    (7, 8):  '\u215E',   # ⅞
+    (1, 7):  '\u2150',   # ⅐
+    (1, 9):  '\u2151',   # ⅑
+    (1, 10): '\u2152',   # ⅒
+}
+
+
+def _gcd(a: int, b: int) -> int:
+    while b:
+        a, b = b, a % b
+    return a
+
+
+def _slice_label(slices: int, per_beat: int) -> str:
+    """
+    Human label for *slices* of a beat when the beat has *per_beat* slices:
+    returns the reduced fraction (e.g. 2 slices of 8 → "¼", 3 of 6 → "½").
+    """
+    a, b = slices, per_beat
+    g = _gcd(a, b)
+    a, b = a // g, b // g
+    if b == 1:
+        return str(a)
+    return _FRACTION_GLYPHS.get((a, b), f'{a}/{b}')
+
 
 class TransportBar(QWidget):
     """Compact single-row transport control attached to an *AudioPlayer*."""
 
     seek_requested = Signal(int)   # position in ms — fired while scrubbing & on release
 
+    # Step buttons move 1/2/3/4 grid slices per press (both directions).
+    _STEP_SLICES = (4, 3, 2, 1)
+
     def __init__(self, player: AudioPlayer, parent=None) -> None:
         super().__init__(parent)
         self._player   = player
         self._seeking  = False
-        self._beat_ms  = 500          # default 120 BPM → 500 ms/beat
 
-        # Single-shot timer: pauses after a one-beat preview
+        # Audition controller: while PAUSED, stepping forward plays the audio
+        # and a fast poll stops it exactly at the step boundary (instead of a
+        # wall-clock timer, which drifts because seeks are asynchronous).
         self._beat_preview = QTimer(self)
-        self._beat_preview.setSingleShot(True)
-        self._beat_preview.timeout.connect(self._player.pause)
+        self._beat_preview.setInterval(10)
+        self._beat_preview.timeout.connect(self._on_audition_tick)
+        self._preview_end_ms   = 0     # boundary the audition stops at
+        self._preview_ticks    = 0     # safety cap so it can never run forever
+
+        # Time signature as a subdivision grid: X beats per bar, Y slices per
+        # beat (editable: 2, 3, 4, 6, 8, 12, 16 … or any typed value).
         self._beats_per_bar = 4
+        self._slices_per_beat = 4
 
         self._build()
         self._wire()
-        self._update_step_tips()
+        self._update_step_buttons()
         # Apply the restored volume to the player: the slider's setValue() in
         # _build() ran before the valueChanged connection existed, so without
         # this the audio would stay at the player's default (100 %) on boot.
@@ -118,7 +185,12 @@ class TransportBar(QWidget):
             b.setFixedSize(34, 30)
             b.setStyleSheet("font-size: 14px; padding: 0;")
 
-        # ── Beat-step buttons  [-1][-½][-¼][-⅛]  [PP]  [+⅛][+¼][+½][+1]
+        # ── Step buttons
+        #
+        # Every button steps by a whole number of GRID SLICES (a slice =
+        # one Y-th of a beat), so each press lands exactly on the subdivision
+        # grid:  [-4][-3][-2][-1]  ▶  [+1][+2][+3][+4]  slices.
+        # Labels show the reduced fraction of a beat each step moves.
         _skip_style = (
             "QPushButton { font-size: 11px; padding: 0; "
             "background: #2a2a2a; color: #cccccc; "
@@ -126,25 +198,26 @@ class TransportBar(QWidget):
             "QPushButton:hover { background: #3a3a3a; border-color: #007acc; }"
             "QPushButton:pressed { background: #1a1a1a; }"
         )
-        self._btn_back_1 = QPushButton("-1")
-        self._btn_back_h = QPushButton("-\u00bd")   # -½
-        self._btn_back_q = QPushButton("-\u00bc")   # -¼
-        self._btn_back_e = QPushButton("-\u215b")   # -⅛
-        self._btn_next_e = QPushButton("+\u215b")   # +⅛
-        self._btn_next_q = QPushButton("+\u00bc")   # +¼
-        self._btn_next_h = QPushButton("+\u00bd")   # +½
-        self._btn_next_1 = QPushButton("+1")
-        self._step_btns: list[tuple[QPushButton, str, float]] = [
-            (self._btn_back_1, "Step back",    -1.0  ),
-            (self._btn_back_h, "Step back",    -0.5  ),
-            (self._btn_back_q, "Step back",    -0.25 ),
-            (self._btn_back_e, "Step back",    -0.125),
-            (self._btn_next_e, "Step forward",  0.125),
-            (self._btn_next_q, "Step forward",  0.25 ),
-            (self._btn_next_h, "Step forward",  0.5  ),
-            (self._btn_next_1, "Step forward",  1.0  ),
+        self._btn_back_1 = QPushButton("-1")   # - 4 slices  (outermost)
+        self._btn_back_h = QPushButton("-1")   # - 3 slices
+        self._btn_back_q = QPushButton("-1")   # - 2 slices
+        self._btn_back_e = QPushButton("-1")   # - 1 slice   (innermost)
+        self._btn_next_e = QPushButton("+1")   # + 1 slice
+        self._btn_next_q = QPushButton("+1")   # + 2 slices
+        self._btn_next_h = QPushButton("+1")   # + 3 slices
+        self._btn_next_1 = QPushButton("+1")   # + 4 slices
+        # (button, back?, slice-count)
+        self._step_btns: list[tuple[QPushButton, bool, int]] = [
+            (self._btn_back_1, True,  4),
+            (self._btn_back_h, True,  3),
+            (self._btn_back_q, True,  2),
+            (self._btn_back_e, True,  1),
+            (self._btn_next_e, False, 1),
+            (self._btn_next_q, False, 2),
+            (self._btn_next_h, False, 3),
+            (self._btn_next_1, False, 4),
         ]
-        for b, _label, _beats in self._step_btns:
+        for b, _back, _n in self._step_btns:
             b.setFixedSize(30, 28)
             b.setStyleSheet(_skip_style)
 
@@ -161,9 +234,9 @@ class TransportBar(QWidget):
         row.addWidget(self._btn_next_q)
         row.addWidget(self._btn_next_h)
         row.addWidget(self._btn_next_1)
-        row.addSpacing(2)
+        row.addSpacing(4)
 
-        # ── Sync — snap the current time to the nearest beat on the fret board
+        # ── Sync — snap the current time to the nearest grid slice
         self._btn_sync = QPushButton()
         self._btn_sync.setIcon(_target_icon())
         self._btn_sync.setFixedSize(30, 28)
@@ -174,8 +247,8 @@ class TransportBar(QWidget):
             "QPushButton:pressed { background:#1a1a1a; }"
         )
         self._btn_sync.setToolTip(
-            "Sync \u2014 snap the current time to the nearest beat\n"
-            "on the fret board grid (BPM-based).")
+            "Sync \u2014 snap the current time to the nearest grid slice\n"
+            "(one Y-th of a beat \u2014 see the time signature / grid).")
         row.addWidget(self._btn_sync)
 
         row.addSpacing(4)
@@ -211,21 +284,25 @@ class TransportBar(QWidget):
         self._bpm.setValue(120)
         self._bpm.setFixedWidth(54)
         self._bpm.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._bpm.setToolTip("Beats per minute — controls beat-step size")
+        self._bpm.setToolTip("Beats per minute — controls beat and slice size")
         self._bpm.setStyleSheet(_spin_style)
         row.addWidget(self._lbl_bpm)
         row.addWidget(self._bpm)
         row.addSpacing(4)
 
-        # ── Time-signature  (numerator spinbox  /  denominator combobox)
+        # ── Time-signature / subdivision grid  (numerator · denominator)
+        #
+        # Read as  X/Y = X beats per bar, each beat split into Y grid slices.
+        # Y is the subdivision grid (standard 2/4/8/16, or triplet-style
+        # grids such as 3, 6, 12 — type any value, 1-64).
         self._lbl_ts_sep = QLabel("/")
         self._lbl_ts_sep.setStyleSheet("color:#555555; font:13px 'Segoe UI';")
         self._ts_num = QSpinBox()
-        self._ts_num.setRange(2, 12)
+        self._ts_num.setRange(2, 32)
         self._ts_num.setValue(4)
-        self._ts_num.setFixedWidth(38)
+        self._ts_num.setFixedWidth(40)
         self._ts_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._ts_num.setToolTip("Beats per bar — numerator of the time signature")
+        self._ts_num.setToolTip("Beats per bar — numerator")
         self._ts_num.setStyleSheet(_spin_style)
 
         _den_style = (
@@ -239,10 +316,17 @@ class TransportBar(QWidget):
             "  selection-background-color:#005f9e; }"
         )
         self._ts_den = QComboBox()
-        self._ts_den.addItems(["2", "4", "8"])
+        self._ts_den.setEditable(True)
+        self._ts_den.addItems(["2", "3", "4", "6", "8", "12", "16"])
         self._ts_den.setCurrentText("4")
-        self._ts_den.setFixedWidth(36)
-        self._ts_den.setToolTip("Beat unit — denominator of the time signature")
+        self._ts_den.setFixedWidth(46)
+        validator = QIntValidator(1, 64, self._ts_den)
+        self._ts_den.lineEdit().setValidator(validator)
+        self._ts_den.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self._ts_den.setToolTip(
+            "Grid slices per beat \u2014 the subdivision grid (denominator)\n"
+            "Common: 2/4/8/16 \u00b7 triplet-style: 3, 6, 12 \u2014 editable, "
+            "e.g. 4/6 or 8/12")
         self._ts_den.setStyleSheet(_den_style)
         row.addWidget(self._ts_num)
         row.addWidget(self._lbl_ts_sep)
@@ -311,53 +395,119 @@ class TransportBar(QWidget):
 
         self._btn_pp.clicked.connect(self._toggle)
         self._btn_stop.clicked.connect(self._player.stop)
-        self._btn_back_1.clicked.connect(lambda: self._step(-1.0))
-        self._btn_back_h.clicked.connect(lambda: self._step(-0.5))
-        self._btn_back_q.clicked.connect(lambda: self._step(-0.25))
-        self._btn_back_e.clicked.connect(lambda: self._step(-0.125))
-        self._btn_next_e.clicked.connect(lambda: self._step(0.125))
-        self._btn_next_q.clicked.connect(lambda: self._step(0.25))
-        self._btn_next_h.clicked.connect(lambda: self._step(0.5))
-        self._btn_next_1.clicked.connect(lambda: self._step(1.0))
+        for b, back, slices in self._step_btns:
+            b.clicked.connect(
+                lambda _=False, back=back, slices=slices:
+                self._step_slices(back, slices))
         self._btn_sync.clicked.connect(self._on_sync)
         self._vol.valueChanged.connect(self._on_volume_changed)
         self._bpm.valueChanged.connect(self._on_bpm_changed)
-        self._ts_num.valueChanged.connect(
-            lambda n: setattr(self, '_beats_per_bar', n))
+        self._ts_num.valueChanged.connect(self._on_ts_num_changed)
+        self._ts_den.currentTextChanged.connect(self._on_ts_den_changed)
         self._lbl_pos.returnPressed.connect(self._on_pos_entered)
         self._lbl_pos.editingFinished.connect(self._on_pos_entered)
 
-    # ── Step-button tooltip helpers ──────────────────────────────────────────
+    # ── Step-button label / tooltip refresh ─────────────────────────────────
 
-    def _update_step_tips(self) -> None:
-        """Refresh all step-button tooltips to reflect the current beat_ms."""
-        _FRAC_NAMES = {
-            1.0:   '1 beat',
-            0.5:   '\u00bd beat',
-            0.25:  '\u00bc beat',
-            0.125: '\u215b beat',
-        }
-        for btn, label, beats in self._step_btns:
-            ms  = abs(beats) * self._beat_ms
-            ms_str = f'{ms:.0f} ms' if ms == int(ms) else f'{ms:.1f} ms'
-            frac   = _FRAC_NAMES.get(abs(beats), f'{abs(beats)} beats')
-            btn.setToolTip(f'{label}  {frac}  ({ms_str})')
+    def _update_step_buttons(self) -> None:
+        """
+        Refresh the step buttons after BPM / time-signature changes: labels
+        show the reduced fraction of a beat (slices/Y), tooltips the slice
+        count and duration, and the Sync tip reflects the current grid.
+        """
+        y = self._slices_per_beat
+        for btn, back, slices in self._step_btns:
+            sign = '-' if back else '+'
+            btn.setText(sign + _slice_label(slices, y))
+            ms    = slices * self.slice_ms()
+            ms_str = (f'{ms:.0f} ms' if abs(ms - round(ms)) < 1e-6
+                      else f'{ms:.1f} ms')
+            label = _slice_label(slices, y).lstrip('-')
+            btn.setToolTip(
+                f"Step {'back' if back else 'forward'}  "
+                f"{slices} grid slice{'s' if slices != 1 else ''}  "
+                f"({label} beat \u00b7 {ms_str})\n"
+                f"Grid: {self._beats_per_bar} beats per bar, "
+                f"{y} slices per beat \u2014 always stays on the grid"
+            )
+        self._btn_sync.setToolTip(
+            "Sync \u2014 snap the current time to the nearest grid slice\n"
+            f"(1/{y} beat \u00b7 {self.slice_ms():.1f} ms)")
+
+    # ── Slots ────────────────────────────────────────────────────────────────
 
     def _on_bpm_changed(self, bpm: int) -> None:
-        self._beat_ms = round(60_000 / bpm)
-        self._update_step_tips()
+        self._update_step_buttons()
+
+    def _on_ts_num_changed(self, beats_per_bar: int) -> None:
+        """Numerator: beats per bar."""
+        self._beats_per_bar = beats_per_bar
+        self._update_step_buttons()
+
+    def _on_ts_den_changed(self, den_text: str) -> None:
+        """
+        Denominator: grid slices per beat (any integer 1-64 — popup lists
+        common values, the field is editable for others).
+        """
+        try:
+            y = int(den_text)
+        except ValueError:
+            y = 0
+        if not (1 <= y <= 64):
+            # Invalid / empty while typing — revert to the last good value.
+            self._ts_den.blockSignals(True)
+            self._ts_den.setCurrentText(str(self._slices_per_beat))
+            self._ts_den.blockSignals(False)
+            return
+        self._slices_per_beat = y
+        self._update_step_buttons()
+
+    def _step_slices(self, back: bool, slices: int) -> None:
+        """
+        Step the playhead by *slices* grid slices — grid-synced.
+
+        The position is converted to a grid-slice INDEX (snapping to the
+        nearest slice first, like Sync) and the step adds/subtracts whole
+        slices in that index space, then converts back with the exact slice
+        length (60 000 / BPM / Y).  Repeated presses therefore never drift:
+        every press lands back exactly on the beat/subdivision grid.
+        """
+        slice_ms = self.slice_ms()          # exact grid slice length
+        pos      = self._player.position
+        k        = int(round(pos / slice_ms))   # nearest slice index (sync)
+        if not back:
+            k += slices
+        else:
+            k -= slices
+        target = int(round(k * slice_ms))
+        target = max(0, target)
+        dur    = self._player.duration
+        if dur > 0:
+            target = min(target, dur)
+
+        was_paused = not self._player.is_playing
+        self._player.seek(target)
+        self.seek_requested.emit(target)
+
+        if was_paused and not back and target > pos:
+            # Audition the skipped section: play from the new position and
+            # stop EXACTLY at the step boundary (the seek is asynchronous, so
+            # a wall-clock timer would let the audio overshoot and desync).
+            self._beat_preview.stop()
+            self._preview_end_ms = target
+            self._preview_ticks  = int((target - pos + 2000) / 10) + 20
+            self._player.play()
+            self._beat_preview.start()
 
     def _on_sync(self) -> None:
         """
-        Snap the current position to the nearest beat of the fret-board grid.
+        Snap the current position to the nearest grid slice.
 
-        The grid on the note highway is anchored at 0 with the exact BPM, so
-        the snap uses 60_000 / bpm (not the rounded step size).
+        The grid is anchored at 0 with the exact BPM, so the snap uses the
+        exact slice length (60 000 / BPM / Y), not the rounded step size.
         """
-        beat = 60_000.0 / max(1, self._bpm.value())
-        pos  = self._player.position
-        snapped = int(round(pos / beat) * beat)
-        snapped = max(0, snapped)
+        pos = self._player.position
+        snapped = self.snap(pos)
         dur = self._player.duration
         if dur > 0:
             snapped = min(snapped, dur)
@@ -370,7 +520,7 @@ class TransportBar(QWidget):
         self._player.set_volume(volume / 100.0)
         QSettings().setValue("audio/volume", volume)
 
-    # ── Slots ─────────────────────────────────────────────────────────────────
+    # ── Transport slots ──────────────────────────────────────────────────────
 
     def _on_pos(self, ms: int) -> None:
         self._envelope.set_position(ms)
@@ -386,16 +536,61 @@ class TransportBar(QWidget):
     def _on_playing(self, playing: bool) -> None:
         self._btn_pp.setText("⏸" if playing else "▶")
 
-
-    # ── Public API ────────────────────────────────────────────────────────────
+    # ── Public API ───────────────────────────────────────────────────────────
 
     def set_timesig(self, num: int, den: int) -> None:
-        """Push a complete time signature into the transport bar widgets."""
+        """Push a time signature into the transport (X beats/bar · Y slices)."""
         self._ts_num.setValue(num)
+        den = max(1, min(64, int(den)))
         den_str = str(den)
         idx = self._ts_den.findText(den_str)
         if idx >= 0:
             self._ts_den.setCurrentIndex(idx)
+        else:
+            # Custom (typed-only) value — e.g. 5, 7, 24.
+            self._ts_den.setCurrentText(den_str)
+        self._beats_per_bar   = num
+        self._slices_per_beat = den
+        self._update_step_buttons()
+
+    def nudge(self, back: bool) -> None:
+        """
+        Step by ONE grid slice (the smallest step) — used by the Left/Right
+        arrow keys.  Forward nudges while paused audition that slice of the
+        audio (play + auto-pause at the exact step boundary); during playback
+        the playhead jumps and audio keeps playing.
+        """
+        self._step_slices(back, 1)
+
+    def bpm(self) -> int:
+        """Current BPM value from the spinbox."""
+        return self._bpm.value()
+
+    def beats_per_bar(self) -> int:
+        """Beats per bar — numerator of the time signature."""
+        return self._beats_per_bar
+
+    def slices_per_beat(self) -> int:
+        """Grid slices per beat — denominator of the time signature."""
+        return self._slices_per_beat
+
+    def beat_ms(self) -> float:
+        """Exact millisecond length of one beat (60 000 / BPM)."""
+        return 60_000.0 / max(1, self._bpm.value())
+
+    def slice_ms(self) -> float:
+        """Exact millisecond length of one grid slice (beat / Y)."""
+        return self.beat_ms() / max(1, self._slices_per_beat)
+
+    def bar_ms(self) -> float:
+        """Millisecond length of one bar (beats per bar × beat)."""
+        return self._beats_per_bar * self.beat_ms()
+
+    def snap(self, ms: int) -> int:
+        """Snap *ms* to the nearest grid slice."""
+        step = self.slice_ms()
+        k = round(ms / step)
+        return int(round(k * step))
 
     def _on_slider_pressed(self) -> None:
         self._seeking = True
@@ -441,18 +636,22 @@ class TransportBar(QWidget):
         else:
             self._player.play()
 
-    def _step(self, beats: float) -> None:
-        """Step forward (positive beats) or backward (negative beats)."""
-        was_paused = not self._player.is_playing
-        skip_ms    = self._beat_ms * beats
-        pos        = round(self._player.position + skip_ms)
-        pos        = max(0, pos)
-        dur        = self._player.duration
-        if dur > 0 and beats > 0:
-            pos = min(pos, dur)
-        self._player.seek(pos)
-        self.seek_requested.emit(pos)
-        if was_paused and beats > 0:
+    def _on_audition_tick(self) -> None:
+        """
+        Poll the playhead during a paused-step audition.  Stops the audio the
+        moment it reaches the step boundary (or when playback was interrupted
+        by the user / safety cap) and snaps the playhead to the boundary so
+        the lights, markers and readout stay in sync.
+        """
+        if not self._player.is_playing:
+            # User pressed stop/pause (or the media ended) mid-audition.
             self._beat_preview.stop()
-            self._player.play()
-            self._beat_preview.start(round(abs(skip_ms)))
+            return
+        if self._player.position >= self._preview_end_ms \
+                or self._preview_ticks <= 0:
+            self._beat_preview.stop()
+            self._player.pause()
+            self._player.seek(self._preview_end_ms)   # snap to the boundary
+            self.seek_requested.emit(self._preview_end_ms)
+        else:
+            self._preview_ticks -= 1
