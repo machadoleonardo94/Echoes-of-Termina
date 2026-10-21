@@ -75,10 +75,6 @@ class AudioPlayer(QObject):
         return self._player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
 
     @property
-    def has_source(self) -> bool:
-        return self._player.source().isValid()
-
-    @property
     def source_path(self) -> str:
         """Local filesystem path of the loaded source ('' for non-file URLs)."""
         return self._player.source().toLocalFile() or ""

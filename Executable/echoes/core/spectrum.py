@@ -164,12 +164,6 @@ _DB_SPAN = DB_CEIL - DB_FLOOR          # 100 dB over the byte range
 _DB_STEP = _DB_SPAN / 255.0
 
 
-def db_to_byte(db: float) -> int:
-    """Quantise a dBFS value to the storage byte range."""
-    v = int((db - DB_FLOOR) / _DB_STEP + 0.5)
-    return 0 if v < 0 else (255 if v > 255 else v)
-
-
 def byte_to_db(b: int) -> float:
     """Expand a stored byte back to dBFS."""
     return DB_FLOOR + b * _DB_STEP
@@ -321,10 +315,6 @@ class Spectrogram:
             return DB_FLOOR
         off = frame * self.bands
         return byte_to_db(max(self._data[off:off + self.bands]))
-
-    def row_bytes(self, band: int) -> bytes:
-        """One band over all frames (band 0 = lowest frequency)."""
-        return bytes(self._data[band::self.bands])
 
 
 # ── Analysis ────────────────────────────────────────────────────────────────

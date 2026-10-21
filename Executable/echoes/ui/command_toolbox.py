@@ -426,6 +426,3 @@ class CommandToolbox(QWidget):
         self._btn_num.setChecked(bool(on))
         self._btn_num.blockSignals(False)
         self._apply_num_style(bool(on))
-
-    def numpad_enabled(self) -> bool:
-        return self._btn_num.isChecked()

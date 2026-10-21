@@ -1,11 +1,13 @@
 """
-DXF zone loader for the Echoes LED canvas.
+Shared DXF primitives for the Echoes LED canvas.
 
-Reads areas_clean.dxf and returns 12 DxfZone objects:
-  Zone  1 — left  eye  (CIRCLE entity, smallest X centroid)
-  Zone  2 — right eye  (CIRCLE entity, largest  X centroid)
-  Zones 3-12 — curved triangular spikes (closed LWPOLYLINE entities),
-               numbered clockwise starting from the top-right spike.
+Provides the :class:`DxfZone` data type plus the low-level readers and path
+builders used by :mod:`core.majoras_loader`, which owns the 28-zone Majora's
+Mask layout:
+
+  _read_pairs / _parse_entities   — raw DXF group-code parsing
+  _circle_path / _polyline_path   — QPainterPath construction (bulge arcs
+                                    included)
 
 Paths are built in DXF coordinate space (Y-up).
 The canvas applies its own QTransform (Y-flip + scale) at paint time.
@@ -13,9 +15,7 @@ The canvas applies its own QTransform (Y-flip + scale) at paint time.
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass
-from typing import Optional
 
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui  import QPainterPath
@@ -25,7 +25,7 @@ from PySide6.QtGui  import QPainterPath
 
 @dataclass
 class DxfZone:
-    zone_id : int            # 1-based (1..12)
+    zone_id : int            # 1-based (1..28)
     path    : QPainterPath   # geometry in DXF coordinate space (Y-up)
     cx      : float          # centroid X (DXF units)
     cy      : float          # centroid Y (DXF units)
@@ -138,79 +138,3 @@ def _polyline_path(xs: list, ys: list, bulges: list, closed: bool) -> QPainterPa
     if closed:
         p.closeSubpath()
     return p
-
-
-# ── Clockwise sort key ────────────────────────────────────────────────────────
-
-def _cw_angle(cx: float, cy: float) -> float:
-    """
-    Clockwise angle (0°..360°) from screen-north (top of canvas).
-    Assumes DXF Y-DOWN convention (positive cy = screen down):
-      north  (cx= 0, cy=-1) → 0°
-      east   (cx= 1, cy= 0) → 90°
-      south  (cx= 0, cy= 1) → 180°
-      west   (cx=-1, cy= 0) → 270°
-    """
-    return math.degrees(math.atan2(cx, -cy)) % 360.0
-
-
-# ── Public API ────────────────────────────────────────────────────────────────
-
-def load_zones(dxf_path: str) -> list:
-    """
-    Parse *dxf_path* and return a list of 12 DxfZone objects ordered 1..12.
-
-    Returns an empty list if the file cannot be read or contains no usable
-    geometry, so callers can fall back to the placeholder canvas gracefully.
-    """
-    try:
-        pairs = _read_pairs(dxf_path)
-        ents  = _parse_entities(pairs)
-    except OSError:
-        return []
-
-    circles   = [e for e in ents if e['type'] == 'CIRCLE'     and e['xs']]
-    polylines = [e for e in ents if e['type'] == 'LWPOLYLINE' and len(e['xs']) >= 2]
-
-    if not circles and not polylines:
-        return []
-
-    zones: list[DxfZone] = []
-
-    # ── Zones 1 & 2 — eye circles ─────────────────────────────────────────────
-    # Left eye (negative X) → zone 1,  right eye (positive X) → zone 2
-    for zone_id, c in enumerate(
-            sorted(circles, key=lambda c: c['xs'][0]), start=1):
-        cx, cy = c['xs'][0], c['ys'][0]
-        r      = c['r'] if c['r'] is not None else 10.0
-        zones.append(DxfZone(
-            zone_id = zone_id,
-            path    = _circle_path(cx, cy, r),
-            cx=cx, cy=cy,
-            xmin=cx - r, xmax=cx + r,
-            ymin=cy - r, ymax=cy + r,
-        ))
-
-    # ── Zones 3-12 — triangular spikes ────────────────────────────────────────
-    # Sort clockwise starting from the top-right spike
-    polylines_cw = sorted(
-        polylines,
-        key=lambda p: _cw_angle(
-            sum(p['xs']) / len(p['xs']),
-            sum(p['ys']) / len(p['ys']),
-        ),
-    )
-    for i, p in enumerate(polylines_cw):
-        xs, ys = p['xs'], p['ys']
-        cx     = sum(xs) / len(xs)
-        cy     = sum(ys) / len(ys)
-        closed = bool(p['flags'] & 1)
-        zones.append(DxfZone(
-            zone_id = i + 3,
-            path    = _polyline_path(xs, ys, p['bulges'], closed),
-            cx=cx, cy=cy,
-            xmin=min(xs), xmax=max(xs),
-            ymin=min(ys), ymax=max(ys),
-        ))
-
-    return sorted(zones, key=lambda z: z.zone_id)

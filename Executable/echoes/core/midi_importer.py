@@ -2,8 +2,8 @@
 Clone Hero / Rock Band notes.mid → echoes script converter.
 
 Parses MIDI type-1 binary files and provides the same public API as
-chart_importer (get_midi_info / convert_midi_tracks), so the existing
-ChartImportDialog and convert flow work unchanged.
+chart_importer (get_midi_info / convert_midi_tracks_per_track), so the
+existing ChartImportDialog and convert flow work unchanged.
 
 MIDI format summary (from thenathannator.github.io/GuitarGame_ChartFormats)
 ───────────────────────────────────────────────────────────────────────────
@@ -29,10 +29,9 @@ from __future__ import annotations
 
 import struct
 from dataclasses import dataclass, field
-from typing import Optional
 
 from core.chart_importer import (
-    GH_FRET_COLORS, LED_PRESETS, MIN_FLASH_MS,
+    MIN_FLASH_MS,
     TrackConfig,
     _build_tempomap, _tick_to_ms, _fmt_time,
     _fade_percent_for_black,
@@ -245,83 +244,6 @@ def get_midi_info(
     ]
 
     return song_meta, tracks, initial_bpm, mid.ts_num, mid.ts_den
-
-
-def convert_midi_tracks(
-    data:    bytes,
-    configs: list[TrackConfig],
-) -> tuple[str, None]:
-    """
-    Convert a notes.mid binary to an echoes script using per-track config.
-
-    Returns (script_text, None) — MIDI files carry no embedded audio path;
-    the caller discovers audio via the reserved-filename search.
-    """
-    mid      = _parse(data)
-    tempomap = _build_tempomap(mid.sync, mid.ticks)
-
-    # Build a name → notes lookup from parsed tracks
-    note_lookup: dict[str, list[tuple[int, int, int]]] = {}
-    for name, notes in mid.tracks:
-        note_lookup[name] = notes
-
-    cmd_lines: list[tuple[float, str]] = []
-
-    for cfg in configs:
-        if not cfg.enabled:
-            continue
-        fret_map = cfg.get_fret_map()
-        notes    = note_lookup.get(cfg.track_name, [])
-
-        for tick, fret, dur_ticks in notes:
-            leds = fret_map.get(fret, '').strip()
-            if not leds:
-                continue
-            r, g, b  = cfg.get_fret_color(fret)
-            start_ms = _tick_to_ms(tick, tempomap)
-            end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
-            dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
-            t        = _fmt_time(start_ms)
-
-            if dur_ms < cfg.short_ms:
-                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
-                                              cfg.fade_percent)
-                cmd_lines.append((
-                    start_ms,
-                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
-                ))
-            else:
-                cmd_lines.append((
-                    start_ms,
-                    f'{t}  SET {r} {g} {b}  {leds}'
-                ))
-                fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
-                t_avail = max(start_ms + dur_ms - fade_ms, 1)
-                pct = _fade_percent_for_black(max(r, g, b), t_avail,
-                                              cfg.fade_percent)
-                cmd_lines.append((
-                    fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
-                ))
-
-    # Sort + deduplicate (same logic as convert_tracks)
-    cmd_lines.sort(key=lambda x: x[0])
-    seen_at: dict[str, float] = {}
-    final:   list[str]        = []
-    for ms, line in cmd_lines:
-        key  = line.split('  ', 1)[1]
-        last = seen_at.get(key, -9999)
-        if ms - last > 50:
-            final.append(line)
-            seen_at[key] = ms
-
-    header = [
-        '#',
-        '# Imported from notes.mid',
-        '',
-    ]
-
-    return '\n'.join(header + final), None
 
 
 def convert_midi_tracks_per_track(

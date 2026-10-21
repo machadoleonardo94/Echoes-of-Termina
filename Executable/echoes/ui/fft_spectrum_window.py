@@ -593,6 +593,17 @@ class SpectrumWindow(QDialog):
 
         self.set_audio_source(self._player.source_path)
 
+        # Seed the transport from the player's CURRENT state. Opened from the
+        # main window the audio is already loaded, so duration_changed and
+        # playing_changed fired long before this window connected: without this
+        # the seek bar stays at range (0, 0) — no end time, nothing to drag.
+        self._sync_transport()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        """Re-read the player state whenever the window is shown again."""
+        super().showEvent(event)
+        self._sync_transport()
+
     # ── UI ─────────────────────────────────────────────────────────────────
 
     def _build_ui(self) -> None:
@@ -730,6 +741,7 @@ class SpectrumWindow(QDialog):
         self._seek.sliderPressed.connect(lambda: setattr(self, "_scrubbing", True))
         self._seek.sliderReleased.connect(self._on_seek_released)
         self._seek.sliderMoved.connect(self._on_seek_moved)
+        self._seek.valueChanged.connect(self._on_seek_value)
 
         self._player.position_changed.connect(self._on_position)
         self._player.duration_changed.connect(self._on_duration)
@@ -827,6 +839,19 @@ class SpectrumWindow(QDialog):
 
     # ── Transport slots ────────────────────────────────────────────────────
 
+    def _sync_transport(self) -> None:
+        """
+        Push the player's current duration / position / play state into the
+        transport row.
+
+        Needed because the player may have been loaded (and already emitted
+        ``duration_changed``) before this window existed — the signals this
+        window connects are not replayed by Qt.
+        """
+        self._on_duration(self._player.duration)
+        self._on_position(self._player.position)
+        self._on_playing(self._player.is_playing)
+
     def _on_play(self) -> None:
         if self._player.is_playing:
             self._player.pause()
@@ -864,6 +889,21 @@ class SpectrumWindow(QDialog):
     def _on_seek_moved(self, value: int) -> None:
         self._lbl_pos.setText(_fmt_ms(value))
         self._view.set_position(int(value))
+
+    def _on_seek_value(self, value: int) -> None:
+        """
+        Seek on user-driven slider changes — a click on the groove or the
+        mouse wheel, which change the value without a handle drag.
+
+        Programmatic updates run with signals blocked (see ``_on_position``),
+        and a handle drag is previewed by ``_on_seek_moved`` and committed
+        once on release, so this only handles the remaining interactions.
+        """
+        if self._scrubbing:
+            return
+        self._lbl_pos.setText(_fmt_ms(value))
+        self._view.set_position(int(value))
+        self._player.seek(int(value))
 
     def _on_seek_released(self) -> None:
         self._scrubbing = False

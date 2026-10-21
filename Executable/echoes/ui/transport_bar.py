@@ -618,10 +618,6 @@ class TransportBar(QWidget):
         """Beats per bar — numerator of the time signature."""
         return self._beats_per_bar
 
-    def slices_per_beat(self) -> int:
-        """Grid slices per beat — denominator of the time signature."""
-        return self._slices_per_beat
-
     def beat_ms(self) -> float:
         """Exact millisecond length of one beat (60 000 / BPM)."""
         return 60_000.0 / max(1, self._bpm.value())

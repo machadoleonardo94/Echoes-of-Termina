@@ -44,9 +44,6 @@ SKIP_NAMES = {
     "LED_order2.dxf",
     "LED_order2.svg",
     "areas_clean.dxf",      # old kokiri layout, superseded by echoes_outline.dxf
-    # Leftover dev helpers
-    "_dxf_inspect.py",
-    "_dxf_zones.py",
 }
 SKIP_SUFFIXES = {
     ".pyc", ".pyo",

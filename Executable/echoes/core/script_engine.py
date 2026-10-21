@@ -405,16 +405,6 @@ class ScriptEngine:
                     states[led] = color
         return states
 
-    def get_active_line_at(self, position_ms: int) -> int:
-        """Return 1-based line number of the last fired command, or -1 if none."""
-        line = -1
-        for cmd in self.commands:
-            if cmd.time_ms <= position_ms:
-                line = cmd.line_number
-            else:
-                break
-        return line
-
     def active_lines_at(self, position_ms: int) -> tuple:
         """
         Return ``(trigger_line, sustaining_lines)`` for *position_ms*.

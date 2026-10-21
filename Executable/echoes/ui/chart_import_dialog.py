@@ -87,13 +87,6 @@ def _dim(text: str) -> QLabel:
     return lbl
 
 
-def _hline() -> QFrame:
-    f = QFrame()
-    f.setFrameShape(QFrame.Shape.HLine)
-    f.setStyleSheet("color:#333; margin:0px;")
-    return f
-
-
 # ── Preset configuration block ────────────────────────────────────────────────
 
 class _PresetRow(QWidget):

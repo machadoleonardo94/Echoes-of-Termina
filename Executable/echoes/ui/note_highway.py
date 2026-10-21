@@ -16,6 +16,11 @@ Screen layout (bottom → top = now → future)
   bottom edge ────────────────────────────────────────────
 ─────────────────────────────────────────────────────────
 
+The highway is a preview of the LED strip over time: the shade of a lane at any
+height equals what ScriptEngine.evaluate_at() reports for that height's
+timestamp, so it always agrees with the LED canvas mask (SET holds, RAMP
+interpolation, and the geometric FADE decay are all reproduced exactly).
+
 The widget receives:
   update_position(pos_ms)  — current playback position
   update_commands(commands) — full parsed command list from ScriptEngine
@@ -55,6 +60,34 @@ _LED_FILL_DIM   = QColor("#252525")
 _MARKER_R_FRAC  = 0.28   # radius of SET/FADE dot markers
 _RAMP_W_FRAC    = 0.55   # width of RAMP bar as fraction of lane width
 
+# Every note body is painted with the SAME alpha, so a lane's shade depends
+# only on the LED value the engine reports at that instant — a SET and the FADE
+# that follows it no longer jump brighter at the note edge.
+_BODY_ALPHA = 200
+_FADE_GRAD_STOPS = 24
+
+
+def _lerp_ch(a: int, b: int, f: float) -> int:
+    """Interpolate one colour channel the way ScriptEngine._lerp does."""
+    return max(0, min(255, int(a + (b - a) * f)))
+
+
+def fade_value(r: int, g: int, b: int, rate: float, t_start_ms: int,
+               t_ms: float) -> tuple:
+    """
+    Colour of a FADE at *t_ms*, byte-for-byte identical to the decay used by
+    ``ScriptEngine.evaluate_at`` (geometric, truncated to int per channel).
+
+    ``rate`` is the per-second multiplier ``(100 - percent) / 100``.
+    """
+    if not (0.0 < rate < 1.0):
+        return (r, g, b)
+    elapsed_s = (t_ms - t_start_ms) / 1000.0
+    if elapsed_s <= 0.0:
+        return (r, g, b)
+    m = rate ** elapsed_s
+    return (int(r * m), int(g * m), int(b * m))
+
 
 class NoteHighway(QWidget):
     """
@@ -71,6 +104,7 @@ class NoteHighway(QWidget):
         self._commands  : list  = []
         self._led_states: dict  = {}      # {zone_id: (r, g, b)}
         self._led_cmd_times: dict = {}    # {led: [sorted command time_ms...]}
+        self._led_winner   : dict = {}    # {(led, time_ms): winning command}
         # Keep the minimum small so the main splitter can hand the script
         # editor a much wider pane when the user drags it.
         self.setMinimumSize(160, 60)
@@ -94,6 +128,14 @@ class NoteHighway(QWidget):
                     times.append(cmd.time_ms)
         for times in self._led_cmd_times.values():
             times.sort()
+        # Charts merged from several tracks often carry two identical commands
+        # at the same timestamp.  Painting both stacks their alpha and makes
+        # the lane read brighter than the LED really is, so remember which
+        # command actually wins each (LED, timestamp) pair.
+        self._led_winner: dict = {}
+        for cmd in commands:
+            for led in cmd.leds:
+                self._led_winner[(led, cmd.time_ms)] = cmd
         self.update()
 
     def update_leds(self, states: dict) -> None:
@@ -238,6 +280,8 @@ class NoteHighway(QWidget):
                     idx = led - 1
                     if not (0 <= idx < _NUM_LEDS):
                         continue
+                    if self._led_winner.get((led, t_start)) is not cmd:
+                        continue   # a duplicate command at this instant wins
                     span = self._visible_span(led, t_start, None, now_ms, end_ms)
                     if span is None:
                         continue
@@ -247,7 +291,7 @@ class NoteHighway(QWidget):
                     rect_top, rect_bot = rect
                     cx = self._lane_cx(idx, lane_w)
                     # Body: slightly transparent so beat-grid lines stay visible
-                    painter.setBrush(QBrush(QColor(r, g, b, 180)))
+                    painter.setBrush(QBrush(QColor(r, g, b, _BODY_ALPHA)))
                     painter.drawRect(QRectF(
                         cx - bar_w * 0.5, rect_top, bar_w,
                         rect_bot - rect_top))
@@ -265,80 +309,110 @@ class NoteHighway(QWidget):
                     continue   # transparent
                 # Time until the integer-truncated decay reaches black (0),
                 # matching ScriptEngine.evaluate_at / the LED strip below.
+                rate    = (100 - cmd.percent) / 100.0
                 max_val = max(r, g, b)
-                decay   = (100 - cmd.percent) / 100.0
-                if 0 < decay < 1 and max_val > 0:
-                    t_black_s = math.log(1.0 / max_val) / math.log(decay)
-                    fade_end_ms = t_start + t_black_s * 1000.0
+                if 0 < rate < 1 and max_val > 0:
+                    t_black_s = math.log(1.0 / max_val) / math.log(rate)
+                    fade_end_ms = int(t_start + t_black_s * 1000.0)
                 else:
-                    fade_end_ms = t_start + 50.0
-
-                # Current decayed colour at the visible bottom of the tail
-                eff_start = max(float(t_start), float(now_ms))
-                elapsed_s = (eff_start - t_start) / 1000.0
-                if elapsed_s > 0 and 0 < decay < 1:
-                    fac   = decay ** elapsed_s
-                    r_now = int(r * fac)
-                    g_now = int(g * fac)
-                    b_now = int(b * fac)
-                else:
-                    r_now, g_now, b_now = r, g, b
+                    fade_end_ms = int(t_start + 50.0)
 
                 for led in cmd.leds:
                     idx = led - 1
                     if not (0 <= idx < _NUM_LEDS):
                         continue
+                    if self._led_winner.get((led, t_start)) is not cmd:
+                        continue   # a duplicate command at this instant wins
                     # Tail ends at the real black point — or earlier when the
                     # next command on this LED takes over — so the fade ends
                     # in sync with the LED (and the note grid).
                     span = self._visible_span(
-                        led, t_start, int(fade_end_ms), now_ms, end_ms)
+                        led, t_start, fade_end_ms, now_ms, end_ms)
                     if span is None:
                         continue
                     rect = _rect_from_span(span)
                     if rect is None:
                         continue
+                    bot_t, top_t = span
                     rect_top, rect_bot = rect
                     cx = self._lane_cx(idx, lane_w)
-                    # Y gradient: current decayed colour at bottom → black,
-                    # transparent at the top (where the fade actually ends)
+                    # Y gradient following the *real* decay: the shade at every
+                    # height equals the engine's LED value at that timestamp.
+                    # A two-stop ramp over-reads the much faster exponential
+                    # falloff and turns each note edge into a hard step.
                     grad = QLinearGradient(cx, rect_bot, cx, rect_top)
-                    grad.setColorAt(0.0, QColor(r_now, g_now, b_now, 230))
-                    grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+                    n_stops = max(2, min(_FADE_GRAD_STOPS,
+                                         int(rect_bot - rect_top) // 2))
+                    span_ms = top_t - bot_t
+                    for k in range(n_stops + 1):
+                        f = k / n_stops
+                        fr, fg, fb = fade_value(
+                            r, g, b, rate, t_start, bot_t + span_ms * f)
+                        grad.setColorAt(f, QColor(fr, fg, fb, _BODY_ALPHA))
                     painter.setBrush(QBrush(grad))
                     painter.drawRect(QRectF(
                         cx - ramp_w * 0.5, rect_top, ramp_w,
                         rect_bot - rect_top))
 
             elif isinstance(cmd, RampCommand):
-                r,  g,  b  = cmd.r0, cmd.g0, cmd.b0
-                r1, g1, b1 = cmd.r1, cmd.g1, cmd.b1
                 t_end = t_start + cmd.duration_ms
-
-                c0 = QColor(r,  g,  b,  0 if (r  == 0 and g  == 0 and b  == 0) else 230)
-                c1 = QColor(r1, g1, b1, 0 if (r1 == 0 and g1 == 0 and b1 == 0) else 230)
+                dur   = float(max(cmd.duration_ms, 1))
 
                 for led in cmd.leds:
                     idx = led - 1
                     if not (0 <= idx < _NUM_LEDS):
                         continue
-                    span = self._visible_span(led, t_start, t_end, now_ms, end_ms)
-                    if span is None:
-                        continue
-                    rect = _rect_from_span(span)
-                    if rect is None:
-                        continue
-                    rect_top, rect_bot = rect
+                    if self._led_winner.get((led, t_start)) is not cmd:
+                        continue   # a duplicate command at this instant wins
                     cx = self._lane_cx(idx, lane_w)
-                    x0 = cx - ramp_w * 0.5
-                    x1 = cx + ramp_w * 0.5
-                    # Diagonal gradient: bottom-left=color0, top-right=color1
-                    grad = QLinearGradient(x0, rect_bot, x1, rect_top)
-                    grad.setColorAt(0.0, c0)
-                    grad.setColorAt(1.0, c1)
-                    painter.setBrush(QBrush(grad))
+
+                    # ── Interpolation segment ────────────────────────────────
+                    span = self._visible_span(led, t_start, t_end, now_ms, end_ms)
+                    rect = _rect_from_span(span) if span else None
+                    if rect is not None:
+                        bot_t, top_t = span
+                        rect_top, rect_bot = rect
+                        # Stops follow the *whole* ramp, not the clipped part of
+                        # it, so a ramp longer than the look-ahead is not
+                        # stretched across the visible window.
+                        f_lo = min(1.0, max(0.0, (bot_t - t_start) / dur))
+                        f_hi = min(1.0, max(0.0, (top_t - t_start) / dur))
+                        # Vertical gradient: bottom=color0, top=color1 — same
+                        # "shade == engine value" contract as the other notes.
+                        grad = QLinearGradient(cx, rect_bot, cx, rect_top)
+                        grad.setColorAt(0.0, QColor(
+                            _lerp_ch(cmd.r0, cmd.r1, f_lo),
+                            _lerp_ch(cmd.g0, cmd.g1, f_lo),
+                            _lerp_ch(cmd.b0, cmd.b1, f_lo), _BODY_ALPHA))
+                        grad.setColorAt(1.0, QColor(
+                            _lerp_ch(cmd.r0, cmd.r1, f_hi),
+                            _lerp_ch(cmd.g0, cmd.g1, f_hi),
+                            _lerp_ch(cmd.b0, cmd.b1, f_hi), _BODY_ALPHA))
+                        painter.setBrush(QBrush(grad))
+                        painter.drawRect(QRectF(
+                            cx - ramp_w * 0.5, rect_top, ramp_w,
+                            rect_bot - rect_top))
+
+                    # ── Hold after the ramp ──────────────────────────────────
+                    # The engine keeps the end colour until the next command on
+                    # this LED, so the lane must stay lit past the ramp end —
+                    # unless another command cut the ramp short, in which case
+                    # that command owns the lane and no hold is drawn (which
+                    # would otherwise stack alpha on top of it).
+                    if max(cmd.r1, cmd.g1, cmd.b1) == 0:
+                        continue
+                    nxt = self._next_cmd_ms(led, t_start)
+                    if nxt is not None and nxt < t_end:
+                        continue
+                    hspan = self._visible_span(led, t_end, nxt, now_ms, end_ms)
+                    hrect = _rect_from_span(hspan) if hspan else None
+                    if hrect is None:
+                        continue
+                    h_top, h_bot = hrect
+                    painter.setBrush(QBrush(QColor(
+                        cmd.r1, cmd.g1, cmd.b1, _BODY_ALPHA)))
                     painter.drawRect(QRectF(
-                        x0, rect_top, ramp_w, rect_bot - rect_top))
+                        cx - ramp_w * 0.5, h_top, ramp_w, h_bot - h_top))
 
         # ── "Now" line ────────────────────────────────────────────────────────
         painter.setPen(QPen(_NOW_LINE, 2.0))

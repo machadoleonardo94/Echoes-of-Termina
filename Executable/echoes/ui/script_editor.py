@@ -182,10 +182,6 @@ class ScriptEditor(QPlainTextEdit):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_active_line(self, line: int) -> None:
-        """Highlight *line* (1-based) as the current playhead command."""
-        self.set_active_lines(line, set())
-
     def set_active_lines(self, trigger: int,
                          sustaining: set | None = None) -> None:
         """
@@ -565,7 +561,6 @@ class MultiTrackEditorWidget(QWidget):
     Public API (mirrors the ScriptEditor subset used by MainWindow):
         set_tracks(dict[str, str])   — load all tracks, rebuild dropdowns
         get_tracks() -> dict         — return all tracks with live editor text
-        set_active_line(int)     — forward to left editor
         set_active_lines(int,set)— playing-note highlights to left editor
         follow_active_line()     — scroll left editor with the playhead
         set_error_lines(set)     — forward to left editor
@@ -733,9 +728,6 @@ class MultiTrackEditorWidget(QWidget):
     def active_track_name(self) -> str:
         """Return the name of the currently active (left) track."""
         return self._left_track
-
-    def set_active_line(self, line: int) -> None:
-        self.set_active_lines(line, set())
 
     def set_active_lines(self, trigger: int,
                          sustaining: set | None = None) -> None:

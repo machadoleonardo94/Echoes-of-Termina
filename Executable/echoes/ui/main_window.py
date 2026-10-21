@@ -21,6 +21,8 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import shutil
+import tempfile
 from typing import Optional
 
 from PySide6.QtCore    import QEvent, QObject, QSettings, Qt, QSize
@@ -111,7 +113,7 @@ from ui.led_canvas       import LEDCanvas
 from ui.macro_dialog     import MacroEditorDialog
 from ui.metadata_dialog  import MetadataDialog
 from ui.note_highway     import NoteHighway
-from ui.script_editor    import MultiTrackEditorWidget, ScriptEditor
+from ui.script_editor    import MultiTrackEditorWidget
 from ui.transport_bar    import TransportBar
 
 # Digit keys 1-9 → macro index.  Numpad digits arrive as the same key codes
@@ -178,6 +180,8 @@ class MainWindow(QMainWindow):
         self._audio  = AudioPlayer(self)
         self._engines: dict[str, ScriptEngine] = {}   # one engine per track slot
         self._script_path: Optional[str] = None
+        # Temp folder holding the merged script during a device upload
+        self._upload_temp_dir: Optional[str] = None
         # Last-browsed folders are cached across sessions so the user does not
         # have to re-navigate at every import / save step.
         self._last_audio_dir:  str = self._saved_dir("folders/audio_dir", _PROJECTS)
@@ -356,9 +360,12 @@ class MainWindow(QMainWindow):
         style = self.style()
         SP    = self.style().StandardPixmap
 
+        # Keyboard shortcuts live on the File-menu actions (see _build_menu):
+        # two QActions with the same shortcut in one window make Qt drop BOTH
+        # as an "ambiguous shortcut overload". The toolbar keeps the buttons
+        # and advertises the key in its tooltip instead.
         act_mp3 = QAction(
             style.standardIcon(SP.SP_MediaVolume), "  Open Audio", self)
-        act_mp3.setShortcut("Ctrl+O")
         act_mp3.setToolTip("Load an audio file  (Ctrl+O)")
         act_mp3.triggered.connect(self._open_mp3)
         tb.addAction(act_mp3)
@@ -367,21 +374,30 @@ class MainWindow(QMainWindow):
 
         act_import = QAction(
             style.standardIcon(SP.SP_FileDialogStart), "  Open Project", self)
-        act_import.setShortcut("Ctrl+Shift+O")
         act_import.setToolTip("Open an existing .echoes project  (Ctrl+Shift+O)")
         act_import.triggered.connect(self._open_script)
         tb.addAction(act_import)
 
         act_export = QAction(
             style.standardIcon(SP.SP_DialogSaveButton), "  Save Script", self)
-        act_export.setShortcut("Ctrl+S")
-        act_export.setToolTip("Save script to file  (Ctrl+S)")
+        act_export.setToolTip(
+            "Save the project — metadata + one [TrackName] section per track,\n"
+            "exactly as laid out in the editor  (Ctrl+S)")
         act_export.triggered.connect(self._save_script)
         tb.addAction(act_export)
 
+        act_mask = QAction(
+            style.standardIcon(SP.SP_DriveHDIcon), "  Export to Mask", self)
+        act_mask.setToolTip(
+            "Merge every track into ONE time-ordered .echoes script and write\n"
+            "it for the mask firmware  (Ctrl+E)\n\n"
+            "The project file keeps its tracks separate — only the exported\n"
+            "copy is merged, because the firmware plays a single stream.")
+        act_mask.triggered.connect(self._export_to_mask)
+        tb.addAction(act_mask)
+
         act_tracks = QAction(
             style.standardIcon(SP.SP_FileDialogDetailedView), "  Import Tracks", self)
-        act_tracks.setShortcut("Ctrl+Shift+I")
         act_tracks.setToolTip("Import tracks from a .chart or .mid file  (Ctrl+Shift+I)")
         act_tracks.triggered.connect(self._import_tracks)
         tb.addAction(act_tracks)
@@ -480,8 +496,10 @@ class MainWindow(QMainWindow):
 
         self._device_upload_btn = QPushButton("Upload Project")
         self._device_upload_btn.setToolTip(
-            "Upload this project's .mp3 and .echoes to\n"
-            "/Echoes/Lightshows/<project name> on the device")
+            "Upload this project's .mp3 and a MERGED .echoes script to\n"
+            "/Echoes/Lightshows/<project name> on the device\n\n"
+            "The local project file keeps its separate tracks; the merged\n"
+            "copy is generated for the transfer only.")
         self._device_upload_btn.clicked.connect(self._device_upload_project)
         tb.addWidget(self._device_upload_btn)
 
@@ -501,6 +519,7 @@ class MainWindow(QMainWindow):
         self._act(fm, "Open &Project\u2026",      "Ctrl+Shift+O",  self._open_script)
         self._act(fm, "&Save Script",             "Ctrl+S",        self._save_script)
         self._act(fm, "Save Script &As\u2026",    "Ctrl+Shift+S",  self._save_script_as)
+        self._act(fm, "&Export to Mask\u2026",     "Ctrl+E",        self._export_to_mask)
         self._act(fm, "Import &Tracks\u2026",     "Ctrl+Shift+I",  self._import_tracks)
         fm.addSeparator()
         self._act(fm, "Script &Properties\u2026", "Ctrl+I",        self._show_properties)
@@ -896,8 +915,13 @@ class MainWindow(QMainWindow):
 
     def _device_upload_project(self) -> None:
         """
-        Upload this project (.mp3 + .echoes) to /Echoes/Lightshows/<name>,
-        asking for the folder name (autocompleted) and overwrite permission.
+        Upload this project to /Echoes/Lightshows/<name>: the audio file plus a
+        MERGED, time-ordered .echoes script, asking for the folder name
+        (autocompleted) and overwrite permission.
+
+        The project file on disk keeps its ``[TrackName]`` sections; the merged
+        copy is generated for the transfer only (the firmware plays a single
+        stream and cannot follow a per-track layout).
         """
         try:
             self._device_upload_project_impl()
@@ -973,7 +997,17 @@ class MainWindow(QMainWindow):
 
         self._device_project_folder = dest
         self._device_upload_btn.setEnabled(False)
-        worker = ProjectUploadWorker(host, dest, [audio, self._script_path])
+        # Write the merged mask script to a private temp file and upload that,
+        # never the multi-track project file.
+        try:
+            script_src = self._write_mask_upload(audio)
+        except OSError as exc:
+            self._device_upload_btn.setEnabled(True)
+            QMessageBox.critical(
+                self, "Cannot prepare the script",
+                f"Could not write the merged mask script:\n\n{exc}")
+            return
+        worker = ProjectUploadWorker(host, dest, [audio, script_src])
         worker.progress.connect(self._on_upload_progress)
         worker.succeeded.connect(self._on_upload_succeeded)
         worker.failed.connect(self._on_upload_failed)
@@ -1017,6 +1051,74 @@ class MainWindow(QMainWindow):
         self._upload_worker = None
         self._device_upload_btn.setEnabled(True)
         self._close_upload_dialog()
+        self._cleanup_upload_temp()
+
+    def _write_mask_upload(self, audio_path: str) -> str:
+        """
+        Write the merged mask script for the current editor state to a private
+        scratch file named after the audio (``song.mp3`` → ``song.echoes``) —
+        the name the firmware prefers when attaching a show to a track.
+
+        Returns the scratch file path. The folder is removed by
+        ``_cleanup_upload_temp`` when the upload finishes.
+        """
+        stem = os.path.splitext(os.path.basename(audio_path))[0] or 'show'
+        self._refresh_auto_meta(self._script_path or '')
+        text = (self._build_meta_header(self._meta)
+                + self._build_mask_body(self._tracks_for_save()))
+        return self._write_scratch_file(f'{stem}.echoes', text)
+
+    def _write_scratch_file(self, filename: str, text: str) -> str:
+        """
+        Write *text* to a private scratch file called *filename*, returning its
+        path. The folder used is remembered in ``_upload_temp_dir`` so
+        ``_cleanup_upload_temp`` can remove it once the upload ends.
+        """
+        self._cleanup_upload_temp()
+        last_exc: Optional[OSError] = None
+        for folder, owned in self._scratch_candidates():
+            path = os.path.join(folder, filename)
+            try:
+                with open(path, 'w', encoding="utf-8") as fh:
+                    fh.write(text)
+            except OSError as exc:
+                last_exc = exc
+                if owned:
+                    shutil.rmtree(folder, ignore_errors=True)
+                continue
+            self._upload_temp_dir = folder
+            return path
+        raise last_exc or OSError(f'Could not write a scratch copy of {filename}')
+
+    def _scratch_candidates(self) -> list:
+        """
+        Candidate scratch folders as ``(path, owned_by_us)``, best first.
+
+        The OS temp folder is preferred; some locked-down Windows profiles and
+        sandboxed runs let the folder be created but then refuse the write, so
+        the project folder is offered as a fallback.
+        """
+        candidates: list = []
+        try:
+            candidates.append((tempfile.mkdtemp(prefix='echoes_upload_'), True))
+        except OSError:
+            pass
+        base = (os.path.dirname(os.path.abspath(self._script_path))
+                if self._script_path else _PROJECTS)
+        fallback = os.path.join(base, '.echoes_upload')
+        try:
+            os.makedirs(fallback, exist_ok=True)
+            candidates.append((fallback, False))
+        except OSError:
+            pass
+        return candidates
+
+    def _cleanup_upload_temp(self) -> None:
+        """Drop the scratch folder that held the merged upload script, if any."""
+        folder = self._upload_temp_dir
+        self._upload_temp_dir = None
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
 
     def _close_upload_dialog(self) -> None:
         dlg = self._upload_dialog
@@ -1037,6 +1139,7 @@ class MainWindow(QMainWindow):
             self._spectrum_window.close()
             self._spectrum_window = None
         self._close_upload_dialog()
+        self._cleanup_upload_temp()
         self._stop_status_poller()
         if self._device_monitor is not None:
             self._device_monitor.stop()
@@ -1064,10 +1167,13 @@ class MainWindow(QMainWindow):
             QSettings().setValue("folders/audio_dir", folder)
 
     def _pick_path(self, title: str, start_dir: str, filters: str,
-                   save: bool = False, multi: bool = False) -> tuple:
+                   save: bool = False, multi: bool = False,
+                   select_name: str = '') -> tuple:
         """
         Open a file dialog and remember the folder the user browsed to — even
         when the dialog is cancelled — so the next import/save starts there.
+
+        *select_name* pre-fills the file name box (save dialogs).
 
         Returns ``(ok, selected_files, browsed_dir)``.
         """
@@ -1079,6 +1185,8 @@ class MainWindow(QMainWindow):
             dlg.setAcceptMode(QFileDialog.AcceptMode.AcceptSave)
         else:
             dlg.setFileMode(QFileDialog.FileMode.ExistingFile)
+        if select_name:
+            dlg.selectFile(select_name)
         ok       = dlg.exec() == QFileDialog.DialogCode.Accepted
         browsed  = dlg.directory().absolutePath() or start_dir
         return ok, dlg.selectedFiles(), browsed
@@ -1111,19 +1219,6 @@ class MainWindow(QMainWindow):
         self._set_track_display("No file loaded")
         self.setWindowTitle("Echoes")
         self.statusBar().showMessage("New project")
-
-    def _open_mp3(self) -> None:
-        ok, files, browsed = self._pick_path(
-            "Open Audio File", self._last_audio_dir,
-            "Audio Files (*.mp3 *.wav *.ogg *.opus *.flac *.aac *.m4a);;All Files (*)",
-        )
-        self._remember_folder('audio', browsed)
-        if not ok or not files:
-            return
-        path = files[0]
-        self._audio.load(path)
-        self._set_track_display(f"  \u266b  {os.path.basename(path)}")
-        self.statusBar().showMessage(f"Loaded: {path}")
 
     def _import_tracks(self) -> None:
         """Unified import for .chart and .mid/.midi files."""
@@ -1446,263 +1541,7 @@ class MainWindow(QMainWindow):
     def _open_script(self) -> None:
         ok, files, browsed = self._pick_path(
             "Open Project", self._last_script_dir,
-            "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
-        )
-        self._remember_folder('script', browsed)
-        if not ok or not files:
-            return
-        path = files[0]
-        try:
-            with open(path, encoding="utf-8") as fh:
-                text = fh.read()
-        except OSError as exc:
-            QMessageBox.critical(self, "Cannot open file", str(exc))
-            return
-        self._meta = self._parse_meta(text)
-        self._sync_meta_to_transport()
-        body = self._strip_meta(text)
-        self._editor.set_tracks(self._parse_tracks(body))
-        self._script_path = path
-        self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
-
-    def _save_script(self) -> None:
-        if os.path.isfile(ini_path):
-            ini_meta = _parse_song_ini(ini_path)
-            # Merge: song.ini wins for keys that exist in both
-            song_meta = {**song_meta, **ini_meta}
-
-        # Append derived timing info for display in the dialog
-        bpm_display = (f'{initial_bpm:.3f}' if initial_bpm != round(initial_bpm)
-                       else str(round(initial_bpm)))
-        song_meta['_Tempo']     = f'{bpm_display} BPM'
-        song_meta['_TimeSig']   = f'{ts_num}/{ts_den}'
-        song_meta['_Resolution'] = song_meta.get('Resolution', '192') + ' ticks/quarter-note'
-
-        dlg = ChartImportDialog(song_meta, tracks, self)
-        if dlg.exec() != ChartImportDialog.DialogCode.Accepted:
-            return
-
-        configs = dlg.get_configs()
-
-        if not any(c.enabled for c in configs):
-            QMessageBox.information(
-                self, "Nothing to import",
-                "No tracks were selected.  Enable at least one track to import.",
-            )
-            return
-
-        track_list, _audio_hint = convert_tracks_per_track(chart_text, configs)
-
-        # ── Merge / assign tracks ─────────────────────────────────────────────
-        existing    = self._editor.get_tracks()
-        import_meta = True
-
-        from ui.import_merge_dialog import ImportMergeDialog, MAX_TRACKS
-        merge_dlg = ImportMergeDialog(
-            [name for name, _ in track_list],
-            list(existing.keys()),
-            self,
-        )
-        if merge_dlg.exec() != ImportMergeDialog.DialogCode.Accepted:
-            return
-
-        incoming_dict = {name: body for name, body in track_list}
-        merged: dict[str, str] = {}
-        for slot_name, source in merge_dlg.get_slot_assignments():
-            if source is None:
-                if slot_name and slot_name in existing:
-                    merged[slot_name] = existing[slot_name]
-            else:
-                if slot_name:
-                    merged[slot_name] = incoming_dict.get(source, '')
-                else:
-                    final = source
-                    n = 2
-                    while final in merged:
-                        final = f"{source} ({n})"; n += 1
-                    merged[final] = incoming_dict.get(source, '')
-
-        if not merged:
-            return
-        self._editor.set_tracks(merged)
-        import_meta = merge_dlg.wants_metadata()
-
-        # ── Populate script metadata from chart info ──────────────────────────
-        def _mv(*keys: str) -> str:
-            """First non-empty value from song_meta for any of the given keys."""
-            for k in keys:
-                v = song_meta.get(k, '').strip().strip('"').strip()
-                if v:
-                    return v
-            return ''
-
-        bpm_int = max(20, min(300, round(initial_bpm)))
-
-        if import_meta:
-            self._meta = {}
-            self._meta['title']   = _mv('Name',    'name')
-            self._meta['author']  = _mv('Artist',  'artist')
-            self._meta['charter'] = _mv('Charter', 'charter')
-            self._meta['album']   = _mv('Album',   'album')
-            self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
-            self._meta['bpm']     = str(bpm_int)
-            self._meta['timesig'] = f'{ts_num}/{ts_den}'
-            if self._audio.duration > 0:
-                self._meta['duration'] = format_ms(self._audio.duration)
-            # ── Sync transport BPM and time signature ────────────────────────────
-            self._transport._bpm.setValue(bpm_int)
-            self._transport.set_timesig(ts_num, ts_den)
-
-        # ── Find and load audio ───────────────────────────────────────────────
-        audio_file = _find_chart_audio(chart_dir, song_meta)
-        if audio_file:
-            audio_path = os.path.join(chart_dir, audio_file)
-            self._audio.load(audio_path)
-            self._set_track_display(f"  \u266b  {audio_file}")
-            self.statusBar().showMessage(
-                f"Imported: {os.path.basename(path)}  \u2014  "
-                f"audio: {audio_file}  \u2014  "
-                f"{bpm_int} BPM  {ts_num}/{ts_den}"
-            )
-        else:
-            self.statusBar().showMessage(
-                f"Imported: {os.path.basename(path)}  \u2014  "
-                f"{bpm_int} BPM  {ts_num}/{ts_den}"
-            )
-
-    def _import_midi(self) -> None:
-        """Import a Clone Hero / Rock Band notes.mid file as an echoes script."""
-        ok, files, browsed = self._pick_path(
-            "Import MIDI Chart", self._last_audio_dir,
-            "MIDI Chart (*.mid *.midi);;All Files (*)",
-        )
-        self._remember_folder('audio', browsed)
-        if not ok or not files:
-            return
-        path = files[0]
-
-        try:
-            with open(path, 'rb') as fh:
-                midi_data = fh.read()
-        except OSError as exc:
-            QMessageBox.critical(self, "Cannot open file", str(exc))
-            return
-
-        from core.midi_importer import get_midi_info, convert_midi_tracks_per_track
-        from ui.chart_import_dialog import ChartImportDialog
-
-        try:
-            song_meta, tracks, initial_bpm, ts_num, ts_den = get_midi_info(midi_data)
-        except ValueError as exc:
-            QMessageBox.critical(self, "Cannot read MIDI file", str(exc))
-            return
-
-        # song.ini in the same folder is the canonical metadata source for .mid
-        chart_dir = os.path.dirname(path)
-        ini_path  = os.path.join(chart_dir, 'song.ini')
-        if os.path.isfile(ini_path):
-            ini_meta  = _parse_song_ini(ini_path)
-            song_meta = {**song_meta, **ini_meta}
-
-        bpm_display = (f'{initial_bpm:.3f}' if initial_bpm != round(initial_bpm)
-                       else str(round(initial_bpm)))
-        song_meta['_Tempo']      = f'{bpm_display} BPM'
-        song_meta['_TimeSig']    = f'{ts_num}/{ts_den}'
-        song_meta['_Resolution'] = song_meta.get('Resolution', '480') + ' ticks/quarter-note'
-
-        dlg = ChartImportDialog(song_meta, tracks, self)
-        if dlg.exec() != ChartImportDialog.DialogCode.Accepted:
-            return
-
-        configs = dlg.get_configs()
-
-        if not any(c.enabled for c in configs):
-            QMessageBox.information(
-                self, "Nothing to import",
-                "No tracks were selected.  Enable at least one track to import.",
-            )
-            return
-
-        track_list, _ = convert_midi_tracks_per_track(midi_data, configs)
-
-        # ── Merge / assign tracks ─────────────────────────────────────────────
-        existing    = self._editor.get_tracks()
-        import_meta = True
-
-        from ui.import_merge_dialog import ImportMergeDialog, MAX_TRACKS
-        merge_dlg = ImportMergeDialog(
-            [name for name, _ in track_list],
-            list(existing.keys()),
-            self,
-        )
-        if merge_dlg.exec() != ImportMergeDialog.DialogCode.Accepted:
-            return
-
-        incoming_dict = {name: body for name, body in track_list}
-        merged: dict[str, str] = {}
-        for slot_name, source in merge_dlg.get_slot_assignments():
-            if source is None:
-                if slot_name and slot_name in existing:
-                    merged[slot_name] = existing[slot_name]
-            else:
-                if slot_name:
-                    merged[slot_name] = incoming_dict.get(source, '')
-                else:
-                    final = source
-                    n = 2
-                    while final in merged:
-                        final = f"{source} ({n})"; n += 1
-                    merged[final] = incoming_dict.get(source, '')
-
-        if not merged:
-            return
-        self._editor.set_tracks(merged)
-        import_meta = merge_dlg.wants_metadata()
-
-        # ── Populate metadata ─────────────────────────────────────────────────
-        def _mv(*keys: str) -> str:
-            for k in keys:
-                v = song_meta.get(k, '').strip().strip('"').strip()
-                if v:
-                    return v
-            return ''
-
-        bpm_int = max(20, min(300, round(initial_bpm)))
-
-        if import_meta:
-            self._meta = {}
-            self._meta['title']   = _mv('Name', 'name')
-            self._meta['author']  = _mv('Artist', 'artist')
-            self._meta['charter'] = _mv('Charter', 'charter')
-            self._meta['album']   = _mv('Album', 'album')
-            self._meta['year']    = re.sub(r'^[,\s]+', '', _mv('Year', 'year'))
-            self._meta['bpm']     = str(bpm_int)
-            self._meta['timesig'] = f'{ts_num}/{ts_den}'
-            if self._audio.duration > 0:
-                self._meta['duration'] = format_ms(self._audio.duration)
-            # ── Sync transport ────────────────────────────────────────────────────
-            self._transport._bpm.setValue(bpm_int)
-            self._transport.set_timesig(ts_num, ts_den)
-
-        # ── Audio ─────────────────────────────────────────────────────────────
-        audio_file = _find_chart_audio(chart_dir, song_meta)
-        if audio_file:
-            self._audio.load(os.path.join(chart_dir, audio_file))
-            self._set_track_display(f"  \u266b  {audio_file}")
-            self.statusBar().showMessage(
-                f"Imported: {os.path.basename(path)}  \u2014  "
-                f"audio: {audio_file}  \u2014  {bpm_int} BPM  {ts_num}/{ts_den}"
-            )
-        else:
-            self.statusBar().showMessage(
-                f"Imported: {os.path.basename(path)}  \u2014  "
-                f"{bpm_int} BPM  {ts_num}/{ts_den}"
-            )
-
-    def _open_script(self) -> None:
-        ok, files, browsed = self._pick_path(
-            "Open Script", self._last_script_dir,
-            "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
+            "Echoes Project (*.echoes);;Text Files (*.txt);;All Files (*)",
         )
         self._remember_folder('script', browsed)
         if not ok or not files:
@@ -1721,6 +1560,10 @@ class MainWindow(QMainWindow):
         """
         Load *text* into the editor: parse metadata, sync the transport,
         populate the track slots and rebuild the engines.
+
+        A project file carries one ``[TrackName]`` section per track, so every
+        track comes back as its own selectable slot. A merged mask script has
+        no sections and therefore loads as a single 'Default' track.
 
         *path* becomes the save target (None = remote/untitled → Save As);
         *title* overrides the window title (used for device-loaded projects).
@@ -1782,6 +1625,8 @@ class MainWindow(QMainWindow):
         else:
             self.statusBar().showMessage(f"Audio not found: {audio_val}")
 
+    # ── Saving the project ────────────────────────────────────────────────────
+
     def _save_script(self) -> None:
         if self._script_path:
             self._write_script(self._script_path)
@@ -1792,7 +1637,7 @@ class MainWindow(QMainWindow):
         ok, files, browsed = self._pick_path(
             "Save Script",
             self._script_path or self._last_script_dir,
-            "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
+            "Echoes Project (*.echoes);;Text Files (*.txt);;All Files (*)",
             save=True,
         )
         self._remember_folder('script', browsed)
@@ -1803,8 +1648,8 @@ class MainWindow(QMainWindow):
         self._write_script(path)
         self.setWindowTitle(f"Echoes — {os.path.basename(path)}")
 
-    def _write_script(self, path: str) -> None:
-        # Refresh auto-fields before writing
+    def _refresh_auto_meta(self, script_path: str) -> None:
+        """Refresh the header fields the editor maintains before writing."""
         self._meta['bpm'] = str(self._transport._bpm.value())
         ts_num = self._transport._ts_num.value()
         ts_den = int(self._transport._ts_den.currentText())
@@ -1813,19 +1658,115 @@ class MainWindow(QMainWindow):
         dur_ms = self._audio.duration
         if dur_ms:
             self._meta['duration'] = format_ms(dur_ms)
-        # Vinculate the loaded audio so opening the script reloads it
-        audio_val = self._audio_ref_for(path)
-        if audio_val:
-            self._meta['audio'] = audio_val
-        tracks = self._editor.get_tracks()
-        body   = self._build_tracks_body(tracks)
+        # Vinculate the loaded audio so opening the project reloads it
+        if script_path:
+            audio_val = self._audio_ref_for(script_path)
+            if audio_val:
+                self._meta['audio'] = audio_val
+
+    def _write_script(self, path: str) -> None:
+        """
+        Save the PROJECT: metadata header + one ``[TrackName]`` section per
+        track, exactly as laid out in the editor.
+
+        Nothing is merged here — the file stays human readable and every track
+        reopens as its own selectable slot. The mask firmware plays a single
+        time-ordered stream it cannot rebuild from a per-track layout, so the
+        merged copy is a separate artefact: see ``_export_to_mask``.
+        """
+        self._refresh_auto_meta(path)
+        text = (self._build_meta_header(self._meta)
+                + self._build_project_body(self._tracks_for_save()))
         try:
             with open(path, "w", encoding="utf-8") as fh:
-                fh.write(self._build_meta_header(self._meta))
-                fh.write(body)
+                fh.write(text)
             self.statusBar().showMessage(f"Saved: {path}")
         except OSError as exc:
             QMessageBox.critical(self, "Cannot save file", str(exc))
+
+    def _tracks_for_save(self) -> dict:
+        """
+        Tracks with live editor text, guaranteed to hold at least one track so
+        a brand-new project (no slot created yet) still saves what was typed.
+        """
+        tracks = self._editor.get_tracks()
+        if not tracks:
+            tracks = {'Default': self._editor.left_editor.toPlainText()}
+        return tracks
+
+    # ── Export to mask ────────────────────────────────────────────────────────
+
+    def _export_to_mask(self) -> None:
+        """
+        Write the MERGED, globally time-ordered script the mask firmware plays.
+
+        This is the only place tracks are merged: the project file written by
+        "Save Script" keeps them separate and readable, while the exported copy
+        collapses them into the single stream the firmware streams from.
+        """
+        tracks = self._tracks_for_save()
+        body   = self._build_mask_body(tracks)
+        if not body.strip():
+            QMessageBox.information(
+                self, "Nothing to export",
+                "There are no lightshow commands to export yet.\n\n"
+                "Add commands to a track first.")
+            return
+
+        # Default destination: <project folder>/<stem>_mask.echoes
+        src    = self._script_path or self._audio.source_path or ''
+        stem   = os.path.splitext(os.path.basename(src))[0] or 'show'
+        folder = (os.path.dirname(os.path.abspath(self._script_path))
+                  if self._script_path else self._last_script_dir)
+        ok, files, _browsed = self._pick_path(
+            "Export to Mask", folder,
+            "Echoes Script (*.echoes);;Text Files (*.txt);;All Files (*)",
+            save=True, select_name=f"{stem}_mask.echoes",
+        )
+        if not ok or not files:
+            return
+        path = files[0]
+        if not path.lower().endswith('.echoes'):
+            path += '.echoes'
+        if (self._script_path and
+                os.path.normcase(os.path.abspath(path)) ==
+                os.path.normcase(os.path.abspath(self._script_path))):
+            QMessageBox.warning(
+                self, "Export to Mask",
+                "That is the project file itself.\n\n"
+                "The merged copy is a separate file — the project keeps its\n"
+                "tracks so it can be edited. Pick another name.")
+            return
+
+        self._refresh_auto_meta(path)
+        text = self._build_meta_header(self._meta) + body
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+        except OSError as exc:
+            QMessageBox.critical(self, "Cannot export file", str(exc))
+            return
+
+        n = len(tracks)
+        self.statusBar().showMessage(f"Mask script exported: {path}")
+        info = (
+            f"Merged {n} track{'s' if n != 1 else ''} into one time-ordered "
+            f"script:\n\n{path}\n\n"
+            "Copy it next to the .mp3 on the SD card "
+            "(/Echoes/Lightshows/<project>/) — keep it the only .echoes in "
+            "that folder, or name it like the audio file so the mask "
+            "attaches it automatically.")
+
+        if self._device_paired:
+            answer = QMessageBox.question(
+                self, "Export to Mask",
+                info + "\n\nUpload it to the mask now?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes)
+            if answer == QMessageBox.StandardButton.Yes:
+                self._device_upload_project()
+            return
+        QMessageBox.information(self, "Export to Mask", info)
 
     # ── Runtime slots ─────────────────────────────────────────────────────────
 
@@ -2071,19 +2012,18 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _parse_tracks(body: str) -> dict:
         """
-        Split a multi-track .echoes body into {track_name: body_text}.
+        Split a .echoes body into {track_name: body_text}.
 
-        Track sections start with a bare ``[TrackName]`` header line.
-        If no headers are found the entire body is returned as a single
-        'Default' track.
-
-        Note: projects are *saved* merged (see ``_build_tracks_body``), so a file
-        written by this application has no headers and reloads as one 'Default'
-        track. The section headers only appear in older, pre-merge files.
+        Track sections start with a bare ``[TrackName]`` header line — that is
+        how ``_build_project_body`` writes a project, so every track of a saved
+        project comes back as its own slot. Stray text before the first header
+        is kept as a leading 'Default' track, and a body with no headers at all
+        is a merged mask script, which loads as one 'Default' track.
         """
         tracks: dict[str, str] = {}
         current_name: str | None = None
         current_lines: list[str] = []
+        preamble: list[str] = []
 
         for line in body.splitlines(keepends=True):
             m = re.match(r'^\[([^\]]+)\]\s*$', line.strip())
@@ -2092,39 +2032,61 @@ class MainWindow(QMainWindow):
                     tracks[current_name] = ''.join(current_lines).strip('\n')
                 current_name = m.group(1)
                 current_lines = []
+            elif current_name is not None:
+                current_lines.append(line)
             else:
-                if current_name is not None:
-                    current_lines.append(line)
+                preamble.append(line)
 
         if current_name is not None:
             tracks[current_name] = ''.join(current_lines).strip('\n')
 
-        if not tracks:
-            stripped = body.strip()
-            if stripped:
-                tracks['Default'] = stripped
+        lead = ''.join(preamble).strip('\n')
+        if lead.strip():
+            if tracks:
+                tracks = {'Default': lead, **tracks}
+            else:
+                tracks['Default'] = lead
 
         return tracks
 
     @staticmethod
-    def _build_tracks_body(tracks: dict) -> str:
+    def _build_project_body(tracks: dict) -> str:
         """
-        Serialise {track_name: body_text} into the .echoes file format.
+        Serialise {track_name: body_text} as a human-readable project body:
+        one ``[TrackName]`` section per track, in editor order.
 
-        Tracks are MERGED into one globally time-ordered command stream, and the
-        ``[TrackName]`` section headers are not written.
+        This is the *editing* format — what "Save Script" writes. Tracks are
+        NOT merged: each section keeps its own timestamps from 0:00, which is
+        exactly what makes the file readable and re-openable with selectable
+        tracks. The firmware cannot play this layout; it gets the merged copy
+        produced by ``_build_mask_body`` ("Export to Mask" / "Upload Project").
+        """
+        blocks: list[str] = []
+        for name, body in tracks.items():
+            clean = str(name).strip().replace('[', '').replace(']', '').strip()
+            text  = (body or '').strip('\n').rstrip()
+            blocks.append(f"[{clean or 'Default'}]\n{text}" if text.strip()
+                          else f"[{clean or 'Default'}]")
+        return '\n\n'.join(blocks) + '\n' if blocks else ''
 
-        Why this is required rather than cosmetic: the firmware plays a script
-        with a single streaming cursor, firing every command whose timestamp has
-        passed. A per-track layout keeps one whole track per block and every
-        block restarts at 0:00, so as soon as the first block is exhausted every
-        remaining command looks "due" and thousands fire in one burst. The
-        firmware validates the file on load and refuses an unsorted one, so a
-        per-track file now simply will not play.
+    @staticmethod
+    def _build_mask_body(tracks: dict) -> str:
+        """
+        Serialise {track_name: body_text} into the MERGED .echoes format the
+        mask firmware plays.
 
-        Consequences: reopening a merged project yields a single 'Default' track
-        (the project's identity lives in the file name), and a provenance comment
-        at the top of the body records what was merged.
+        Why merging is required for the hardware rather than cosmetic: the
+        firmware plays a script with a single streaming cursor, firing every
+        command whose timestamp has passed. A per-track layout keeps one whole
+        track per block and every block restarts at 0:00, so as soon as the
+        first block is exhausted every remaining command looks "due" and
+        thousands fire in one burst. The firmware refuses an unsorted file, so
+        a per-track file simply will not play.
+
+        No ``[TrackName]`` headers are written: this copy is a flat stream, and
+        it is produced only here — the project file on disk keeps its tracks
+        apart (see ``_build_project_body``). A provenance comment at the top of
+        the body records what was merged.
 
         Lines without a timestamp — comments, blanks, malformed lines — are kept
         verbatim and travel with the next command of their track, so nothing a
@@ -2138,7 +2100,7 @@ class MainWindow(QMainWindow):
 
         for t_i, body in enumerate(tracks.values()):
             pending: list[str] = []
-            for raw in body.splitlines():
+            for raw in (body or '').splitlines():
                 line = raw.rstrip()
                 m = ts_re.match(line)
                 if m:

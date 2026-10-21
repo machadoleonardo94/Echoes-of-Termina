@@ -1,0 +1,39 @@
+# FADE / RAMP edge cases for the note highway renderer.
+# Verify with:  python _verify_highway_fade.py -s _fade_edge_cases.echoes 0 1500 3000 5000 7000 9000 11000
+#
+# LED 1  – slow fade (50 %/s) with no successor: tail runs off the look-ahead
+# LED 2  – fast fade (99 %/s) re-triggered every half beat
+# LED 3  – fade that is already black before "now" is reached
+# LED 4  – two identical SET commands at the same instant (must not stack alpha)
+# LED 5  – fade of a dim colour, no preceding SET
+# LED 6  – SET immediately followed by a fade on a grey
+# LED 7  – bright fade that reaches black inside the visible window
+# LED 8  – dim fade, decays below one unit within a second
+# LED 9  – ramp longer than the 2-beat look-ahead (gradient must not stretch)
+# LED 10 – ramp that is cut short by another command (no stale hold)
+# LED 11 – ramp exactly ending on a SET (no doubled alpha at the seam)
+# LED 12 – ramp to black followed by a hold-colour ramp
+0:00.000  SET 255 0 0  1
+0:00.000  FADE 255 0 0 50  1
+0:02.000  SET 0 0 255  2
+0:02.000  FADE 0 0 255 99  2
+0:02.214  SET 0 0 255  2
+0:02.214  FADE 0 0 255 99  2
+0:03.000  SET 0 255 0  3
+0:03.000  FADE 0 255 0 99  3
+0:03.500  SET 0 255 0  4
+0:03.500  SET 0 255 0  4
+0:04.000  FADE 120 60 30 90  5
+0:05.000  SET 200 200 200  6
+0:05.200  FADE 200 200 200 99  6
+0:06.000  SET 255 255 255  7
+0:06.100  FADE 255 255 255 99  7
+0:07.000  SET 10 10 10  8
+0:07.000  FADE 10 10 10 99  8
+0:08.000  RAMP 0:02  255 0 0  0 0 255  9
+0:11.000  RAMP 0:02  0 255 0  255 255 0  10
+0:11.500  SET 200 0 0  10
+0:13.000  RAMP 0:01  255 0 0  0 0 255  11
+0:14.000  SET 0 255 0  11
+0:15.000  RAMP 0:01  0 0 0  200 200 0  12
+0:16.000  RAMP 0:01  200 200 0  10 200 60  12
