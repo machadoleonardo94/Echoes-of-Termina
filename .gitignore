@@ -1,36 +1,91 @@
-# ── Python ───────────────────────────────────────────────────────────────────
+# Echoes of Termina — repository-wide ignore rules
+# =============================================================================
+# This is the only shared .gitignore. Each PlatformIO project under Firmware/
+# also keeps a two-line local file for its own .pio/.vscode noise, but anything
+# that could appear anywhere in the tree belongs HERE instead of being copied
+# into the nested files.
+#
+# Layout:
+#   1. Python                 caches and packaging by-products
+#   2. Build / release output generated artifacts, never source
+#   3. Firmware               PlatformIO build data and capture logs
+#   4. KiCad                  per-machine files, backups and locks
+#   5. Editors / OS           local tool state
+#   6. Demo projects          shipped empty until DRM-free content lands
+#   7. Deliberately tracked   things that LOOK generated but must stay in Git
+# =============================================================================
+
+# ── 1. Python ────────────────────────────────────────────────────────────────
+# Byte-code caches and editable-install metadata are regenerated on the next
+# import; they cause merge noise and never belong in history.
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
 *.egg-info/
-dist/
-build/
-*.spec
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# ── Release builds ───────────────────────────────────────────────────────────
-Executable/echoes/dist/
-
-# Virtual environments
+# Virtual environments: exact interpreter + package set is a property of each
+# machine, not of the project.
 .venv/
 venv/
 env/
 
-# ── Firmware ────────────────────────────────────────────────────────────────
-.pio/
+# ── 2. Build / release output ────────────────────────────────────────────────
+# PyInstaller spec files and build trees, plus the zipped editor release.
+# build_release.py writes its ZIP into Executable/echoes/dist/, which the bare
+# dist/ pattern already covers (dist/build/ match at any depth).
+dist/
+build/
+*.spec
 
-# ── VS Code ───────────────────────────────────────────────────────────────────
+# ── 3. Firmware (PlatformIO) ─────────────────────────────────────────────────
+# .pio/ holds the downloaded toolchain and every per-env build object.
+# compile_commands.json is machine-specific build metadata.
+# *.log comes from tools/serial_capture.py (e.g. serial_click2.log, serial_flash.log).
+.pio/
+compile_commands.json
+*.log
+
+# ── 4. KiCad ─────────────────────────────────────────────────────────────────
+# Backup folders, project locks, the footprint cache and per-save backups are
+# all local working state.
+*-backups/
+*.lck
+fp-info-cache
+*.kicad_pcb-bak
+*.kicad_sch-bak
+*.kicad_sym-bak
+*.kicad_pro-bak
+# NOTE: *.kicad_prl is intentionally TRACKED (board layout/layer state ships
+# with the project). Ignoring it here would do nothing for already-tracked
+# files and would be wrong: it needs `git rm --cached` first if that decision
+# is ever reversed.
+
+# ── 5. Editors / OS ──────────────────────────────────────────────────────────
 .vscode/.browse.c_cpp.db*
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
-
-# ── Hardware ────────────────────────────────────────────────────────────────────
-*-backups/
-*.lck
-fp-info-cache
-
-# ── OS ────────────────────────────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# ── 6. Demo projects ─────────────────────────────────────────────────────────
+# The release ships projects/ EMPTY for now: Keep the README so the folder
+# survives a fresh clone; ignore everything else under it until the DRM-free
+# content set is added. Local test projects (e.g. "Lost Woods") stay on disk
+# but never reach Git.
+Executable/echoes/projects/*
+!Executable/echoes/projects/README.txt
+
+# ── 7. Deliberately tracked — do not "fix" these with ignore rules ───────────
+# These names look generated but are required to build, document or reproduce:
+#   Firmware/echoes_of_termina/boards/*.json        board defs for each env
+#   Firmware/echoes_of_termina/partitions_*.csv     partition tables per flash size
+#   Firmware/echoes_of_termina/docs/**              flowcharts + two-button UI doc
+#   Firmware/echoes_of_termina/tools/*.py           serial_capture, make_flowcharts
+#   Hardware/**/production/**                       fab outputs (BOM, netlist, ZIP)
+#   Datasheets/**                                   component reference PDFs
+#   Executable/echoes/projects/README.txt           placeholder that keeps the folder
+#   Firmware/**/.vscode/extensions.json             shared extension recommendations
