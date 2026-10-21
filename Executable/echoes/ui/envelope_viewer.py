@@ -19,6 +19,13 @@ view pans just enough to keep it inside — the zoom level is never changed.
 The band is deliberately narrow so the view catches up with the cursor
 quickly (small dead zone).
 
+Following is re-armed every time playback starts or resumes, so the view
+picks the playhead back up after a pause even if the user had panned away
+to inspect the track.  Only a real drag stops following: a click that slips
+a few pixels, or a stray pointer move after a lost mouse release, must not
+silently switch it off (that left the playhead running off the edge with no
+way back except a double-click).
+
 The audio is decoded with one fast ffmpeg pass (QAudioDecoder fallback); the
 envelope is a per-time-bucket peak/RMS list rebuilt on source changes.
 """
@@ -58,6 +65,10 @@ _MIN_VIEW_MS = 100  # minimum zoomed-in time window width (X axis)
 # margins = smaller dead zone = the view follows the cursor sooner.
 _FOLLOW_MARGIN_L = 0.25   # left edge of the follow band (fraction of view)
 _FOLLOW_MARGIN_R = 0.25   # right edge of the follow band (fraction of view)
+
+# A press that slips a few pixels is still a click, not a drag: the view only
+# starts panning — and following is only dropped — past this many pixels.
+_PAN_MIN_DRAG_PX = 8
 
 
 class _EnvelopeWorker(QThread):
@@ -133,7 +144,7 @@ class EnvelopeViewer(QWidget):
             "Audio envelope\n"
             "wheel: zoom time  \u00b7  drag: pan  \u00b7  "
             "double-click: reset zoom\n"
-            "follows playback \u2014 drag the envelope to stop following\n"
+            "follows playback \u2014 drag to stop following (play re-arms it)\n"
             "grip: drag to collapse / stretch  \u00b7  "
             "double-click grip: toggle")
 
@@ -190,8 +201,10 @@ class EnvelopeViewer(QWidget):
         """
         Move the cursor to *pos_ms* and keep edge-following from there.
 
-        Used while scrubbing the progress bar — the cursor moves across the
-        view and the envelope pans only when it reaches the follow band.
+        Used while scrubbing the progress bar and whenever playback starts or
+        resumes — the cursor moves across the view and the envelope pans only
+        when it reaches the follow band.  Calling this is what re-arms
+        following after the view was panned away or the playhead drifted out.
         """
         self._follow = True
         self.set_position(pos_ms)
@@ -404,6 +417,12 @@ class EnvelopeViewer(QWidget):
         self._view_start_ms = max(0.0, min(vs, dur - vd))
 
     def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            # Right / middle clicks must not start a pan or a resize: they
+            # used to arm the drag state, and the first pointer move then
+            # stopped following as a side effect.
+            super().mousePressEvent(event)
+            return
         if self._on_grip(event.position().y()):
             self._resizing = True
             self._grip_down_y = event.globalPosition().y()
@@ -419,25 +438,36 @@ class EnvelopeViewer(QWidget):
         event.accept()
 
     def mouseMoveEvent(self, event) -> None:
+        held = bool(event.buttons() & Qt.MouseButton.LeftButton)
         if self._resizing:
-            dy = event.globalPosition().y() - self._grip_down_y
-            h  = max(_MIN_H, min(_MAX_H, int(self._h_at_down - dy)))
-            if h != self._height:
-                self._apply_height(h)
-            event.accept()
-            return
+            if not held:
+                # The release was delivered elsewhere (window switch, dialog):
+                # drop the resize instead of tracking a buttonless pointer.
+                self._resizing = False
+            else:
+                dy = event.globalPosition().y() - self._grip_down_y
+                h  = max(_MIN_H, min(_MAX_H, int(self._h_at_down - dy)))
+                if h != self._height:
+                    self._apply_height(h)
+                event.accept()
+                return
         if self._panning:
-            if not self._pan_moved and \
-                    abs(event.position().x() - self._pan_x0) > 3:
-                self._pan_moved = True
-                self._follow = False     # manual pan overrides follow mode
-            vs, vd = self._eff_view()
-            if vd > 0:
-                dx = (event.position().x() - self._pan_x0) / max(1, self.width())
-                self._view_start_ms = self._pan_view_start - dx * vd
-                self.update()
-            event.accept()
-            return
+            if not held:
+                # Same for a pan: a plain hover must never pan the view nor
+                # stop following (the press that started it is long over).
+                self._panning = False
+            else:
+                if not self._pan_moved and \
+                        abs(event.position().x() - self._pan_x0) > _PAN_MIN_DRAG_PX:
+                    self._pan_moved = True
+                    self._follow = False     # manual pan overrides follow mode
+                vs, vd = self._eff_view()
+                if vd > 0:
+                    dx = (event.position().x() - self._pan_x0) / max(1, self.width())
+                    self._view_start_ms = self._pan_view_start - dx * vd
+                    self.update()
+                event.accept()
+                return
         # hover cursor
         self.setCursor(Qt.CursorShape.SizeVerCursor
                        if self._on_grip(event.position().y())

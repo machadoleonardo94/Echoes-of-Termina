@@ -23,9 +23,9 @@ from __future__ import annotations
 from PySide6.QtCore    import QPointF, QRectF, Qt, QSettings, QTimer, Signal
 from PySide6.QtGui     import (QBrush, QColor, QIcon, QIntValidator, QPainter,
                                 QPen, QPixmap)
-from PySide6.QtWidgets import (QComboBox, QHBoxLayout, QLabel, QLineEdit,
-                                QPushButton, QSlider, QSpinBox, QVBoxLayout,
-                                QWidget)
+from PySide6.QtWidgets import (QApplication, QComboBox, QHBoxLayout, QLabel,
+                                QLineEdit, QPushButton, QSlider, QSpinBox,
+                                QVBoxLayout, QWidget)
 
 from core.audio_player import AudioPlayer
 from ui.envelope_viewer import EnvelopeViewer
@@ -342,7 +342,9 @@ class TransportBar(QWidget):
         self._lbl_pos = QLineEdit("0:00.00")
         self._lbl_pos.setFixedWidth(68)
         self._lbl_pos.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._lbl_pos.setToolTip("Current position — type M:SS.cc and press Enter to seek")
+        self._lbl_pos.setToolTip(
+            "Current position \u2014 type M:SS.cc and press Enter to seek\n"
+            "(tracks playback; holds still only while you edit or select it)")
         self._lbl_pos.setStyleSheet(
             "QLineEdit {"
             "  font: 11px 'Consolas', monospace; color: #aaaaaa;"
@@ -523,10 +525,50 @@ class TransportBar(QWidget):
     # ── Transport slots ──────────────────────────────────────────────────────
 
     def _on_pos(self, ms: int) -> None:
+        """
+        Position tick from the player — keep the transport display on the
+        audio position.
+
+        Only the control the user is actively working with steps aside: the
+        progress bar while it is being dragged, the readout while its text is
+        being edited.  Everything used to be gated on the readout *not* having
+        focus, so clicking the position field once (and then pressing a
+        toolbar button, which never steals focus) froze the slider and the
+        readout for as long as the field kept focus — the transport looked
+        dead while the song played on.
+        """
+        if self._seeking and not self._mouse_button_held():
+            # The release that ends a slider drag can be delivered elsewhere
+            # (window switch, a dialog opening): trusting the flag forever
+            # would freeze the whole display, so fall back to the live audio
+            # position instead.
+            self._seeking = False
+        if self._seeking:
+            return                      # the drag owns the display until release
         self._envelope.set_position(ms)
-        if not self._seeking and not self._lbl_pos.hasFocus():
-            self._seek.setValue(ms)
+        self._seek.setValue(ms)
+        if not self._pos_is_being_edited():
             self._lbl_pos.setText(_fmt(ms))
+
+    @staticmethod
+    def _mouse_button_held() -> bool:
+        """
+        True while a mouse button is down — lets a position tick notice a
+        slider drag whose release was never delivered.  A method (not an
+        inline call) so the state can be pinned in tests.
+        """
+        return bool(QApplication.mouseButtons() & Qt.MouseButton.LeftButton)
+
+    def _pos_is_being_edited(self) -> bool:
+        """
+        True while the position readout holds text the user is working on —
+        typed but not committed yet, or selected for replacement.  The live
+        ticks must not overwrite that.  A field that merely has focus is still
+        a display and keeps tracking the audio.
+        """
+        if not self._lbl_pos.hasFocus():
+            return False            # a leftover selection must not freeze it
+        return self._lbl_pos.isModified() or self._lbl_pos.hasSelectedText()
 
     def _on_dur(self, ms: int) -> None:
         self._envelope.set_duration(ms)
@@ -535,6 +577,12 @@ class TransportBar(QWidget):
 
     def _on_playing(self, playing: bool) -> None:
         self._btn_pp.setText("⏸" if playing else "▶")
+        if playing:
+            # (Re)arm envelope following on every start / resume.  Pressing
+            # play means "show me the music", so the view must pick the
+            # playhead back up even when it had been panned away (or silently
+            # stopped following) while the track was paused.
+            self._envelope.follow_position(self._player.position)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -599,7 +647,7 @@ class TransportBar(QWidget):
         # Move the cursor with the drag; the envelope pans only when the
         # cursor reaches the (narrow) follow band edge.
         self._envelope.follow_position(value)
-        if not self._lbl_pos.hasFocus():
+        if not self._pos_is_being_edited():
             self._lbl_pos.setText(_fmt(value))
         self.seek_requested.emit(value)
 
@@ -610,8 +658,21 @@ class TransportBar(QWidget):
         self.seek_requested.emit(pos)
 
     def _on_pos_entered(self) -> None:
-        """Parse the typed timestamp and seek, then give focus back to the window."""
+        """
+        Commit a timestamp typed into the position readout and seek there.
+
+        Wired to both ``returnPressed`` and ``editingFinished`` — Qt emits the
+        latter on Enter *and* when the field loses focus.  Only text the user
+        actually entered is committed: focusing the field and clicking away
+        again used to re-seek playback to whatever the readout happened to be
+        showing, which could be a stale position (the readout was frozen while
+        it had focus) rather than a request to move anywhere.
+        """
         from core.script_engine import _parse_timestamp
+
+        if not self._lbl_pos.isModified():
+            return              # nothing typed — this is not a seek request
+
         raw = self._lbl_pos.text().strip()
         ms  = _parse_timestamp(raw)
         if ms is None:
@@ -624,9 +685,9 @@ class TransportBar(QWidget):
             ms = max(0, min(ms, self._player.duration or ms))
             self._player.seek(ms)
             self.seek_requested.emit(ms)
-            self._lbl_pos.setText(_fmt(ms))
+            self._lbl_pos.setText(_fmt(ms))   # also clears the modified flag
         else:
-            # Restore current position on bad input
+            # Restore the live position on bad input
             self._lbl_pos.setText(_fmt(self._player.position))
         self._lbl_pos.clearFocus()
 

@@ -106,6 +106,7 @@ def _parse_song_ini(path: str) -> dict:
 
 from ui.command_toolbox  import CommandToolbox
 from ui.device_browser_dialog import DeviceBrowserDialog
+from ui.fft_spectrum_window import SpectrumWindow
 from ui.led_canvas       import LEDCanvas
 from ui.macro_dialog     import MacroEditorDialog
 from ui.metadata_dialog  import MetadataDialog
@@ -198,6 +199,7 @@ class MainWindow(QMainWindow):
         self._device_online  = False
         self._device_info: Optional[dict] = None
         self._device_browser: Optional["DeviceBrowserDialog"] = None
+        self._spectrum_window: Optional["SpectrumWindow"] = None
         self._device_status: Optional[dict] = None       # latest /api/status
         self._status_poller: Optional[DeviceStatusPoller] = None
         self._upload_worker: Optional[ProjectUploadWorker] = None
@@ -518,6 +520,9 @@ class MainWindow(QMainWindow):
             "something else.  (Neither ever fires while editing text.)")
         self._numpad_action.toggled.connect(self._on_numpad_changed)
         tm.addAction(self._numpad_action)
+        tm.addSeparator()
+        self._act(tm, "FFT &Spectrum Analyser\u2026", "Ctrl+Shift+F",
+                  self._open_spectrum)
 
     def _act(self, menu, label: str, shortcut: str, slot) -> QAction:
         a = QAction(label, self)
@@ -619,6 +624,23 @@ class MainWindow(QMainWindow):
         self._update_device_ui()
         if self._device_paired:
             self._open_device_browser()
+
+    def _open_spectrum(self) -> None:
+        """
+        Open (or re-focus) the FFT spectrum analyser window.
+
+        The window is deliberately separate from the main layout for now: it
+        shares this window's AudioPlayer, so it analyses whatever is loaded
+        and follows the transport, but nothing in the editor changes when it
+        is closed.
+        """
+        if self._spectrum_window is None:
+            self._spectrum_window = SpectrumWindow(self._audio, self)
+            self._spectrum_window.destroyed.connect(
+                lambda: setattr(self, "_spectrum_window", None))
+        self._spectrum_window.show()
+        self._spectrum_window.raise_()
+        self._spectrum_window.activateWindow()
 
     def _device_host(self) -> str:
         """Best host string for device HTTP calls (IP preferred over mDNS)."""
@@ -1011,6 +1033,9 @@ class MainWindow(QMainWindow):
         if self._device_browser is not None:
             self._device_browser.close()
             self._device_browser = None
+        if self._spectrum_window is not None:
+            self._spectrum_window.close()
+            self._spectrum_window = None
         self._close_upload_dialog()
         self._stop_status_poller()
         if self._device_monitor is not None:
@@ -2051,6 +2076,10 @@ class MainWindow(QMainWindow):
         Track sections start with a bare ``[TrackName]`` header line.
         If no headers are found the entire body is returned as a single
         'Default' track.
+
+        Note: projects are *saved* merged (see ``_build_tracks_body``), so a file
+        written by this application has no headers and reloads as one 'Default'
+        track. The section headers only appear in older, pre-merge files.
         """
         tracks: dict[str, str] = {}
         current_name: str | None = None
@@ -2079,14 +2108,59 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _build_tracks_body(tracks: dict) -> str:
-        """Serialise {track_name: body_text} to multi-track file format."""
+        """
+        Serialise {track_name: body_text} into the .echoes file format.
+
+        Tracks are MERGED into one globally time-ordered command stream, and the
+        ``[TrackName]`` section headers are not written.
+
+        Why this is required rather than cosmetic: the firmware plays a script
+        with a single streaming cursor, firing every command whose timestamp has
+        passed. A per-track layout keeps one whole track per block and every
+        block restarts at 0:00, so as soon as the first block is exhausted every
+        remaining command looks "due" and thousands fire in one burst. The
+        firmware validates the file on load and refuses an unsorted one, so a
+        per-track file now simply will not play.
+
+        Consequences: reopening a merged project yields a single 'Default' track
+        (the project's identity lives in the file name), and a provenance comment
+        at the top of the body records what was merged.
+
+        Lines without a timestamp — comments, blanks, malformed lines — are kept
+        verbatim and travel with the next command of their track, so nothing a
+        user wrote is dropped. A track's trailing non-command lines go last.
+        """
+        ts_re = re.compile(r'^(\d+):([0-5]\d)(?:\.(\d{1,3}))?(?=\s|$)')
+
+        # (time_ms, track_index, sequence, [lines to emit])
+        items: list[tuple] = []
+        trailing: list[str] = []
+
+        for t_i, body in enumerate(tracks.values()):
+            pending: list[str] = []
+            for raw in body.splitlines():
+                line = raw.rstrip()
+                m = ts_re.match(line)
+                if m:
+                    millis  = int(m.group(3).ljust(3, '0')) if m.group(3) else 0
+                    time_ms = (int(m.group(1)) * 60 + int(m.group(2))) * 1000 + millis
+                    items.append((time_ms, t_i, len(items), pending + [line]))
+                    pending = []
+                else:
+                    pending.append(line)
+            trailing.extend(l for l in pending if l.strip())
+
+        # Deterministic merge: by time, then by track order, then by source order.
+        items.sort(key=lambda it: (it[0], it[1], it[2]))
+
         parts: list[str] = []
-        for name, body in tracks.items():
-            parts.append(f'[{name}]')
-            b = body.strip('\n')
-            if b:
-                parts.append(b)
-            parts.append('')
+        if len(tracks) > 1:
+            parts.append('# merged from %d tracks: %s'
+                         % (len(tracks), ', '.join(tracks)))
+        for _, _, _, lines in items:
+            parts.extend(lines)
+        parts.extend(trailing)
+
         return '\n'.join(parts) + '\n' if parts else ''
 
     @staticmethod

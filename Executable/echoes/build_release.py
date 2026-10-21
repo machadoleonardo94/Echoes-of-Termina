@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import zipfile
 from pathlib import Path
-VERSION  = "0.7.0"
+VERSION  = "0.8.0"
 
 HERE     = Path(__file__).resolve().parent   # tools/echoes/
 DIST_DIR = HERE / "dist"
@@ -23,9 +23,11 @@ ZIP_PATH = DIST_DIR / f"Echoes_v{VERSION}.zip"
 # ── Include list (relative to HERE) ──────────────────────────────────────────
 INCLUDE = [
     "Run Echoes.bat",
+    "Run Spectrum.bat",
     "Echoes.pyw",
     "requirements.txt",
     "main.py",
+    "spectrum.py",          # standalone FFT spectrum analyser launcher
     "core",
     "ui",
     "assets",
@@ -118,9 +120,10 @@ if __name__ == "__main__":
     _sys.path.insert(0, str(HERE))
     for _mod in ("core.script_engine", "core.audio_player",
                  "core.audio_converter", "core.device_discovery",
-                 "core.device_media", "core.dxf_loader",
+                 "core.device_media", "core.dxf_loader", "core.spectrum",
                  "ui.transport_bar",
                  "ui.script_editor", "ui.led_canvas", "ui.main_window",
+                 "ui.fft_spectrum_window",
                  "ui.track_mix_dialog"):
         try:
             importlib.import_module(_mod)

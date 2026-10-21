@@ -1,25 +1,25 @@
 @echo off
-:: Echoes light-show editor
+:: Echoes FFT spectrum analyser — standalone window
 :: Double-click to launch.  Python 3.10+ with PySide6 required.
 ::
-:: First-time setup (run once in this folder):
-::   python -m pip install --user -r requirements.txt
+:: Drag an audio file onto this file (or pass a path) to analyse it straight
+:: away; otherwise use the "Open Audio..." button in the window.
 
 cd /d "%~dp0"
 
-if not exist "Echoes.pyw" (
-    echo [ERROR] Echoes.pyw not found in this folder.
+if not exist "spectrum.py" (
+    echo [ERROR] spectrum.py not found in this folder.
     pause
     exit /b 1
 )
 
 where pythonw >nul 2>&1
 if %errorlevel% == 0 (
-    start "" pythonw "Echoes.pyw"
+    start "" pythonw "spectrum.py" %*
 ) else (
     where python >nul 2>&1
     if %errorlevel% == 0 (
-        start "" python "Echoes.pyw"
+        start "" python "spectrum.py" %*
     ) else (
         echo [ERROR] Python not found. Install Python 3.10+ and try again.
         echo         https://www.python.org/downloads/
