@@ -6277,7 +6277,7 @@
 		)
 		(uuid "9192fa70-f81d-459b-98d9-efc89dc4a13d")
 	)
-	(text "Cutoff Q2 pulls Vg(Q1) high\nPMOS blocks battery discharge\nButton trigger activates Q2\nQ1 saturates, V_REG = V_BAT - 200mV\nESP32 boots, drive GPIO25 high to latch power on"
+	(text "Cutoff Q2 pulls Vg(Q1) high\nPMOS blocks battery discharge\nButton trigger activates Q2\nQ1 saturates, V_REG = V_BAT - 200mV\nESP32 boots, drive GPIO23 high to latch power on"
 		(exclude_from_sim no)
 		(at 110.998 104.648 0)
 		(effects

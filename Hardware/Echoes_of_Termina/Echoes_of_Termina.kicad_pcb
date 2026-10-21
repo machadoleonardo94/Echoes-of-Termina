@@ -543,15 +543,15 @@
 			(uuid "d438159d-692e-4adc-95ab-1d0b18200e5b")
 		)
 		(embedded_fonts no)
-		(model "${KICAD9_3DMODEL_DIR}/Connector_Hirose.3dshapes/Hirose_DF13C_CL535-0404-8-51_1x04-1MP_P1.25mm_Vertical.step"
+		(model "C:/Github/AleoExpress_KiCad_libs/Step files/CONN-SMD_4P-P1.25_HCZZ0015-4.step"
 			(offset
-				(xyz 0 0 0)
+				(xyz 0 -1 4.5)
 			)
 			(scale
 				(xyz 1 1 1)
 			)
 			(rotate
-				(xyz 0 0 0)
+				(xyz -0 -0 -0)
 			)
 		)
 	)
@@ -16663,15 +16663,15 @@
 			(uuid "ef3432ca-02e5-4657-b585-9d00299be969")
 		)
 		(embedded_fonts no)
-		(model "${KICAD9_3DMODEL_DIR}/Connector_Hirose.3dshapes/Hirose_DF13C_CL535-0404-8-51_1x04-1MP_P1.25mm_Vertical.step"
+		(model "C:/Github/AleoExpress_KiCad_libs/Step files/CONN-SMD_4P-P1.25_HCZZ0015-4.step"
 			(offset
-				(xyz 0 0 0)
+				(xyz 0 -1 4.5)
 			)
 			(scale
 				(xyz 1 1 1)
 			)
 			(rotate
-				(xyz 0 0 0)
+				(xyz -0 -0 -0)
 			)
 		)
 	)
@@ -24068,6 +24068,17 @@
 			(uuid "f1e49b66-dd39-4bec-87b6-45ce4ed32d52")
 		)
 		(embedded_fonts no)
+		(model "C:/Github/AleoExpress_KiCad_libs/Step files/USB-C-SMD_GT-USB-7101A.step"
+			(offset
+				(xyz 0 -6 1.5)
+			)
+			(scale
+				(xyz 1 1 1)
+			)
+			(rotate
+				(xyz -0 -0 -0)
+			)
+		)
 	)
 	(gr_poly
 		(pts
