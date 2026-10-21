@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# ESP32-WROOM-32 N16 (16 MB flash, no PSRAM).
+# Same dual-slot OTA layout as partitions_8mb.csv, scaled to the larger chip:
+#   0x10000 .. 0x800000   ota_0  (0x7F0000 = 8 MB - 64 KB)
+#   0x800000 .. 0xFF0000  ota_1  (0x7F0000)
+#   0xFF0000 .. 0x1000000 coredump (last 64 KB)
+# No SPIFFS/LittleFS: the web UI is an embedded string, WiFi credentials live
+# in NVS, and media lives on the SD card.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xE000,   0x2000,
+ota_0,    app,  ota_0,   0x10000,  0x7F0000,
+ota_1,    app,  ota_1,   0x800000, 0x7F0000,
+coredump, data, coredump,0xFF0000, 0x10000,

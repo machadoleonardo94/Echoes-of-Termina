@@ -11,8 +11,18 @@
 //*    M:SS[.mmm]  FADE R G B PERCENT           LED-SPEC
 //*
 //*  LED-SPEC: single "5", range "1-5", list "1,3,5", or wildcard "*".
-//*  Track headers ([Name]) and metadata (# @key value) lines are ignored;
-//*  commands from all tracks are merged in file order.
+//*
+//*  TIME ORDER IS PART OF THE FORMAT: timestamps must be globally
+//*  non-decreasing over the whole file. The editor merges its tracks on export,
+//*  so a multi-track project arrives here already interleaved. Track headers
+//*  ([Name]) and metadata (# @key value) lines are skipped, and only survive as
+//*  comments for readability.
+//*
+//*  Why that matters: the parser streams a single cursor through the file and
+//*  fires every command whose timestamp has passed. A legacy per-track file
+//*  stores one whole track per block, so once the first block is exhausted
+//*  every remaining command looks "due" and thousands of them fire at once.
+//*  load_lightshow() validates the file up front and refuses an unsorted one.
 //*
 //*  Memory: commands are STREAMED from the SD card as the playhead advances
 //*  (the ESP32 has too little RAM to hold a full show alongside the audio
@@ -21,6 +31,12 @@
 //*  Timing: the engine follows an EXTERNAL playhead fed by the audio player
 //*  (lightshow_set_playhead_ms) so the show stays locked to the song — pause
 //*  freezes it, stop clears it, seeks re-sync it.
+//*
+//*  Frame rate: derived from the strip length, not fixed. Driving the strip costs
+//*  ~29 us per LED (Adafruit's ESP32 path blocks for the whole RMT transfer), so a
+//*  single frame period cannot suit both a 28-LED mask and a 200-LED strip. See
+//*  lightshow_frame_period_ms(). FADEs decay by REAL elapsed time, so how fast a
+//*  fade fades does not depend on that period.
 //? ------------------------------------------------------------------------------------------
 
 #include "shared/dependencies.h"
@@ -29,9 +45,41 @@
 // Configuration
 // ---------------------------------------------------------------------------
 
-#define LIGHTSHOW_TIMESTEP_MS 5  // frame period (must be > ~1.15 ms for 28 LEDs)
+// Frame period. A WS2812 frame costs 24 bits x 1.2 us = 28.8 us per LED plus
+// ~0.34 ms of fixed overhead (reset/latch and the RMT refill handshake). That
+// reproduces the figure the engine was originally tuned around: 28 LEDs ->
+// 28*0.0288 + 0.34 = 1.15 ms. The 2.5x margin keeps show() under ~40% duty so the
+// rest of the loop still has time for the decoder.
+//
+// Yields exactly the old 5 ms at 28 LEDs (so existing mask shows are unchanged),
+// and stretches only as the strip grows: 8 ms at 96, 11 ms at 144, 15 ms at 200
+// LEDs — still ~66 fps at the top of the range.
+#define LIGHTSHOW_LED_US 28.8f
+#define LIGHTSHOW_SHOW_OVERHEAD_MS 0.34f
+#define LIGHTSHOW_MIN_TIMESTEP_MS 5
+#define LIGHTSHOW_DUTY_MARGIN 2.5f
+
+// Not static: services/ui_feedback.h is included above this file (the renderers
+// yield to the overlay, so the overlay has to be declared first) and paces its own
+// frames with this. Same translation unit, so this is the only caller-facing change.
+uint16_t lightshow_frame_period_ms()
+{
+    float show_ms = LIGHTSHOW_SHOW_OVERHEAD_MS +
+                    LIGHTSHOW_LED_US * (float)majora_led_count / 1000.0f;
+    uint16_t period = (uint16_t)(show_ms * LIGHTSHOW_DUTY_MARGIN + 0.5f);
+    return period < LIGHTSHOW_MIN_TIMESTEP_MS ? LIGHTSHOW_MIN_TIMESTEP_MS : period;
+}
+
+// A stall longer than this is not a frame; decaying by the full gap would nuke
+// every fade at once. Seeks are handled separately by the playhead re-sync.
+#define LIGHTSHOW_MAX_FRAME_DT_S 0.5f
+
 #define MAX_ADDR_PER_INSTR 8     // explicit addresses per line (wildcard uses the all flag)
 #define LIGHTSHOW_LINE_LEN 160   // max parsed line length (long lines are truncated)
+// How far a timestamp may go backwards before the file counts as unsorted.
+// The export is an exact merge, so this only absorbs hand-edited jitter; the
+// legacy per-track layout breaks order by whole tracks (seconds), not by ms.
+#define LIGHTSHOW_BACKSTEP_TOLERANCE_MS 1000
 
 #define INSTR_SET 0
 #define INSTR_FADE 1
@@ -57,7 +105,11 @@ typedef struct
 typedef struct
 {
     float red = 0.0f, green = 0.0f, blue = 0.0f;
-    float hodl = 1.0f;                     // per-frame retention (SET = 1.0)
+    // Per-SECOND colour retention (1.0 = no decay, used by SET and RAMP). The
+    // per-frame decay factor is derived from this and the real elapsed time in
+    // run_lightshow(). Storing a per-frame factor here instead — as this used to —
+    // ties every FADE's speed to the frame period, which is now strip-dependent.
+    float retention = 1.0f;
     bool  ramp_active = false;
     float ramp_r0 = 0.0f, ramp_g0 = 0.0f, ramp_b0 = 0.0f;
     float ramp_r1 = 0.0f, ramp_g1 = 0.0f, ramp_b1 = 0.0f;
@@ -76,7 +128,20 @@ static uint16_t show_current_index = 0;    // placeholder kept for API symmetry
 static uint32_t show_playhead_ms = 0;
 static uint32_t show_last_pos_ms = 0;
 static bool show_playing = false;
-static wellerman_pixel_t w_pixels[MAJORA_LEDS];
+// Timestamp of the last rendered frame. File-scope (not function-static) so that
+// lightshow_play() can anchor it: otherwise the first frame of a new show would
+// measure its dt from the PREVIOUS show's last frame — clamped to the 0.5 s
+// ceiling, which would over-decay a FADE fired on that very first frame.
+static uint32_t show_last_frame_ms = 0;
+// Per-LED working buffer, allocated LAZILY by lightshow_play() and released by
+// lightshow_stop().
+//
+// Sized for MAJORA_MAX_LEDS it is ~10.4 KB, which is why it is not a static
+// array: a .echoes show can only ever run when the SD player is up, so in
+// Bluetooth mode — where the reactive envelope/FFT animations need the RAM — a
+// never-used show buffer must not be resident. Measured cost of the static
+// version: +8.9 KB of .bss at boot, in every mode.
+static wellerman_pixel_t *w_pixels = nullptr;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -131,6 +196,12 @@ static uint32_t _lightshow_parse_time_ms(const char *s)
 // Parses an LED-SPEC token into 0-indexed addresses; returns the count.
 // Supports comma-separated values ("3,12"), inclusive dash ranges ("7-8"),
 // mixed forms ("3,7-9,12") and the wildcard "*" (sets out->all).
+//
+// Addresses beyond the configured strip length are dropped rather than clamped: a
+// show authored for a 200-LED strip played on a 28-LED one simply does not reach
+// the missing LEDs. The wildcard is the case that must NOT be filtered here — it
+// is expanded against majora_led_count at apply time, so "*" always covers exactly
+// the strip that is attached.
 static uint8_t _lightshow_parse_addrs(const char *addr_str, lightshow_instr_t *out)
 {
     if (strcmp(addr_str, "*") == 0)
@@ -164,14 +235,14 @@ static uint8_t _lightshow_parse_addrs(const char *addr_str, lightshow_instr_t *o
             for (int i = first; i <= last && count < MAX_ADDR_PER_INSTR; i++)
             {
                 int idx = i - 1; // 1-indexed -> 0-indexed
-                if (idx >= 0 && idx < MAJORA_LEDS)
+                if (idx >= 0 && idx < (int)majora_led_count)
                     out->addr[count++] = (uint8_t)idx;
             }
         }
         else
         {
             int addr = atoi(tok) - 1; // 1-indexed file -> 0-indexed array
-            if (addr >= 0 && addr < MAJORA_LEDS)
+            if (addr >= 0 && addr < (int)majora_led_count)
                 out->addr[count++] = (uint8_t)addr;
         }
         tok = strtok(NULL, ",");
@@ -297,24 +368,84 @@ static void _lightshow_rewind()
     _lightshow_advance();
 }
 
+// Reads the whole file once to check the format invariant the streamed parser
+// depends on: timestamps must be non-decreasing from start to end.
+//
+// A legacy per-track file (one contiguous block per [track]) violates this at
+// every block boundary, and the parser would answer the jump by firing the rest
+// of the file in one burst. Better to refuse it at load and say why.
+//
+// Costs one full pass over the file (a 135 KB show is ~40 ms at the measured
+// ~3.4 MB/s), which is paid once, at load, not per frame.
+static bool _lightshow_validate(uint32_t *cmd_count, uint16_t *track_count, uint32_t *last_ms)
+{
+    char line[LIGHTSHOW_LINE_LEN];
+    lightshow_instr_t ins;
+    uint32_t count = 0;
+    uint32_t prev_ms = 0;
+    uint32_t total_ms = 0;
+    uint16_t tracks = 0;
+    bool have_prev = false;
+    bool sorted = true;
+
+    show_file.seek(0);
+    while (_lightshow_read_line(line, sizeof(line)))
+    {
+        const char *p = line;
+        while (*p == ' ' || *p == '\t')
+            p++;
+        if (*p == '[')
+        {
+            tracks++;
+            continue;
+        }
+        if (!_lightshow_parse_line(line, &ins))
+            continue;
+
+        if (have_prev && ins.time_ms + LIGHTSHOW_BACKSTEP_TOLERANCE_MS < prev_ms)
+        {
+            Serial.printf("[Lightshow] NOT time-sorted at command %u: %u ms follows %u ms\n",
+                          count + 1, ins.time_ms, prev_ms);
+            sorted = false;
+            break;
+        }
+        prev_ms = ins.time_ms;
+        total_ms = ins.time_ms;
+        have_prev = true;
+        count++;
+    }
+    show_file.seek(0);
+
+    if (cmd_count)
+        *cmd_count = count;
+    if (track_count)
+        *track_count = tracks;
+    if (last_ms)
+        *last_ms = total_ms;
+    return sorted;
+}
+
 // Applies a single command to the w_pixels working buffer.
 // *scale* (0..1) dims SET/FADE colours — used when re-syncing a FADE that
 // started before the current playhead position.
 static void _lightshow_apply_instr(const lightshow_instr_t *instr, float scale = 1.0f)
 {
-    float hodl = 1.0f;
+    if (w_pixels == nullptr)
+        return;
+
+    // Per-second retention (see wellerman_pixel_t). SET and RAMP do not decay.
+    float retention = 1.0f;
     if (instr->type == INSTR_FADE)
     {
         // Exponential decay: per-second retention = (100 - fade%) / 100
-        float retention_per_sec = (100.0f - (float)instr->fade) / 100.0f;
-        hodl = powf(retention_per_sec, LIGHTSHOW_TIMESTEP_MS / 1000.0f);
+        retention = (100.0f - (float)instr->fade) / 100.0f;
     }
 
-    uint8_t count = instr->all ? MAJORA_LEDS : instr->addr_count;
+    uint8_t count = instr->all ? (uint8_t)majora_led_count : instr->addr_count;
     for (uint8_t a = 0; a < count; a++)
     {
         uint8_t idx = instr->all ? a : instr->addr[a];
-        if (idx >= MAJORA_LEDS)
+        if (idx >= majora_led_count)
             continue;
         wellerman_pixel_t &px = w_pixels[idx];
 
@@ -332,14 +463,14 @@ static void _lightshow_apply_instr(const lightshow_instr_t *instr, float scale =
             px.ramp_start_ms = instr->time_ms;
             px.ramp_end_ms = instr->time_ms + instr->dur_ms;
             px.ramp_active = true;
-            px.hodl = 1.0f;
+            px.retention = 1.0f;
         }
         else
         {
             px.red = (float)instr->r * scale;
             px.green = (float)instr->g * scale;
             px.blue = (float)instr->b * scale;
-            px.hodl = hodl;
+            px.retention = retention;
             px.ramp_active = false;
         }
     }
@@ -350,7 +481,12 @@ static void _lightshow_apply_instr(const lightshow_instr_t *instr, float scale =
 // primes the next command after *ms*.
 static void _lightshow_resync(uint32_t ms)
 {
-    for (int i = 0; i < MAJORA_LEDS; i++)
+    if (w_pixels == nullptr)
+        return;
+
+    // The whole buffer, not just the configured count: the strip length can change
+    // at runtime, and a stale entry beyond the old count would light up on growth.
+    for (int i = 0; i < MAJORA_MAX_LEDS; i++)
         w_pixels[i] = wellerman_pixel_t();
 
     show_file.seek(0);
@@ -408,6 +544,20 @@ bool load_lightshow(const char *filepath)
         return false;
     }
 
+    // Validate before playing: an unsorted file would dump its remaining
+    // commands in one burst mid-song (see the format note at the top).
+    uint32_t cmd_count = 0, last_ms = 0;
+    uint16_t track_count = 0;
+    if (!_lightshow_validate(&cmd_count, &track_count, &last_ms))
+    {
+        Serial.println("[Lightshow] Refusing to play: re-export the project so the tracks are merged in time order");
+        show_file.close();
+        show_has_next = false;
+        return false;
+    }
+    Serial.printf("[Lightshow] %s: %u commands, %u track header(s), last at %u ms\n",
+                  filepath, (unsigned)cmd_count, (unsigned)track_count, (unsigned)last_ms);
+
     _lightshow_rewind();
     Serial.printf("[Lightshow] Streaming %s  (first command at %u ms, heap %u KB free)\n",
                   filepath,
@@ -419,12 +569,30 @@ bool load_lightshow(const char *filepath)
 // Starts playback, following the external playhead (audio position).
 void lightshow_play()
 {
-    for (int i = 0; i < MAJORA_LEDS; i++)
+    if (w_pixels == nullptr)
+    {
+        w_pixels = (wellerman_pixel_t *)malloc(MAJORA_MAX_LEDS * sizeof(wellerman_pixel_t));
+        if (w_pixels == nullptr)
+        {
+            Serial.printf("[Lightshow] Cannot allocate the pixel buffer (%u bytes) — %u KB free\n",
+                          (unsigned)(MAJORA_MAX_LEDS * sizeof(wellerman_pixel_t)),
+                          (unsigned)(ESP.getFreeHeap() / 1024));
+            return; // leave show_playing false: the engine never ran
+        }
+        Serial.printf("[Lightshow] Pixel buffer allocated: %u bytes for up to %u LEDs\n",
+                      (unsigned)(MAJORA_MAX_LEDS * sizeof(wellerman_pixel_t)),
+                      (unsigned)MAJORA_MAX_LEDS);
+    }
+
+    for (int i = 0; i < MAJORA_MAX_LEDS; i++)
         w_pixels[i] = wellerman_pixel_t();
     show_playhead_ms = 0;
     show_last_pos_ms = 0;
     show_fired_count = 0;
     show_current_index = 0;
+    // Anchor the frame clock to now, so the first frame's dt is one loop
+    // iteration rather than however long ago the last show ended.
+    show_last_frame_ms = millis();
     _lightshow_rewind();
     show_playing = true;
     Serial.printf("[Lightshow] Playback attached (first command at %u ms)\n",
@@ -443,7 +611,18 @@ void lightshow_stop()
         show_file = File();
     }
     show_has_next = false;
-    for (int i = 0; i < MAJORA_LEDS; i++)
+
+    // Release the pixel buffer so the RAM is back for the reactive animations
+    // (and for the audio path). _sync_lightshow() does NOT stop between tracks
+    // that both have shows — it goes straight to load + play — so this does not
+    // churn a 10.4 KB malloc on every track change.
+    if (w_pixels != nullptr)
+    {
+        free(w_pixels);
+        w_pixels = nullptr;
+    }
+
+    for (int i = 0; i < (int)majora_led_count; i++)
         majora.setPixelColor(i, 0);
     majora.show();
     Serial.println("[Lightshow] Playback stopped");
@@ -465,17 +644,52 @@ void lightshow_set_playhead_ms(uint32_t ms)
     show_last_pos_ms = ms;
 }
 
+// One-entry memo for the fade decay factor. Consecutive fading pixels almost
+// always share a FADE percentage and every pixel shares the frame's dt, so this
+// turns a powf per pixel per frame into one per frame — worth having because the
+// cost would otherwise scale with the strip length (200 LEDs at 66 fps).
+static float _lightshow_decay(float retention, float dt_s)
+{
+    static float c_ret = -1.0f, c_dt = -1.0f, c_decay = 1.0f;
+    if (retention != c_ret || dt_s != c_dt)
+    {
+        c_ret = retention;
+        c_dt = dt_s;
+        c_decay = powf(retention, dt_s);
+    }
+    return c_decay;
+}
+
 // Frame update — call every loop iteration.
 // Fires due commands, advances ramps, decays fades, pushes to the strip.
 void run_lightshow()
 {
-    if (!show_playing)
+    if (!show_playing || w_pixels == nullptr)
         return;
 
-    static uint32_t last_update = 0;
-    if (millis() - last_update < LIGHTSHOW_TIMESTEP_MS)
+    // The UI overlay owns the strip while it reports a gesture
+    // (services/ui_feedback.h). Skip drawing, but keep the show's own state
+    // advancing: the playhead and the decay are driven from the audio position and
+    // millis(), so the show is exactly where it should be when the overlay lets go.
+    if (ui_feedback_active())
+    {
+        show_last_frame_ms = millis();
         return;
-    last_update = millis();
+    }
+
+    uint16_t period = lightshow_frame_period_ms();
+    uint32_t now = millis();
+    uint32_t since = now - show_last_frame_ms;
+    if (since < period)
+        return;
+    show_last_frame_ms = now;
+
+    // Decay by the time that ACTUALLY passed, not the nominal period. The loop can
+    // overrun (a long SD read, an HTTP request, a stall), and using the nominal
+    // period would make fades drift slow exactly when the system is busy.
+    float dt_s = (float)since / 1000.0f;
+    if (dt_s > LIGHTSHOW_MAX_FRAME_DT_S)
+        dt_s = LIGHTSHOW_MAX_FRAME_DT_S;
 
     uint32_t elapsed = show_playhead_ms;
 
@@ -484,9 +698,10 @@ void run_lightshow()
     if (elapsed / 1000 != last_beat)
     {
         last_beat = elapsed / 1000;
-        Serial.printf("[Lightshow] t=%u ms  fired=%u  next=%u ms\n",
+        Serial.printf("[Lightshow] t=%u ms  fired=%u  next=%u ms  period=%u ms  leds=%u\n",
                       elapsed, show_fired_count,
-                      show_has_next ? show_next.time_ms : 0);
+                      show_has_next ? show_next.time_ms : 0,
+                      (unsigned)period, (unsigned)majora_led_count);
     }
 
     // Fire all commands whose timestamp has passed (streamed from the SD)
@@ -499,7 +714,7 @@ void run_lightshow()
     }
 
     // Update pixels: lerp active ramps, decay fades, keep SETs
-    for (int i = 0; i < MAJORA_LEDS; i++)
+    for (int i = 0; i < (int)majora_led_count; i++)
     {
         wellerman_pixel_t &px = w_pixels[i];
 
@@ -511,7 +726,7 @@ void run_lightshow()
                 px.green = px.ramp_g1;
                 px.blue = px.ramp_b1;
                 px.ramp_active = false;
-                px.hodl = 1.0f;
+                px.retention = 1.0f;
             }
             else
             {
@@ -524,11 +739,16 @@ void run_lightshow()
                 px.blue = px.ramp_b0 + (px.ramp_b1 - px.ramp_b0) * t;
             }
         }
-        else if (px.red > 0.5f || px.green > 0.5f || px.blue > 0.5f)
+        else if (px.retention < 1.0f &&
+                 (px.red > 0.5f || px.green > 0.5f || px.blue > 0.5f))
         {
-            px.red *= px.hodl;
-            px.green *= px.hodl;
-            px.blue *= px.hodl;
+            // FADE: decay by real elapsed time. SETs and finished RAMPs carry
+            // retention == 1.0 and are skipped entirely (the old code multiplied
+            // them by a 1.0 factor every frame).
+            float decay = _lightshow_decay(px.retention, dt_s);
+            px.red *= decay;
+            px.green *= decay;
+            px.blue *= decay;
         }
 
         majora.setPixelColor(i, majora.Color(

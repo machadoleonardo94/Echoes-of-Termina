@@ -1,0 +1,18 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# ESP32-WROOM-32-N8R2 (8 MB flash, 2 MB PSRAM) — the Marajoara_V3 hardware.
+# Dual-slot OTA (ota_0 + ota_1) so Update.h / updatefromSD() can write the
+# inactive slot and the bootloader can roll back. The otadata partition is
+# required for the bootloader to track which slot is active; without it a
+# dual-slot table cannot switch slots.
+#
+# The two app slots split the flash evenly after the 64 KB system area:
+#   0x10000 .. 0x400000  ota_0  (0x3F0000 = 4 MB - 64 KB)
+#   0x400000 .. 0x7F0000 ota_1  (0x3F0000)
+#   0x7F0000 .. 0x800000 coredump (last 64 KB)
+# No SPIFFS/LittleFS: the web UI is an embedded string, WiFi credentials live
+# in NVS, and media lives on the SD card.
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xE000,   0x2000,
+ota_0,    app,  ota_0,   0x10000,  0x3F0000,
+ota_1,    app,  ota_1,   0x400000, 0x3F0000,
+coredump, data, coredump,0x7F0000, 0x10000,

@@ -13,6 +13,14 @@ void run_majoras()
     if (millis() - lastUpdate < 10)
         return;
     lastUpdate = millis();
+
+    // Mask-specific: the last two LEDs are the eyes, so this needs at least three.
+    // NOTE: this path is currently unreachable — main.cpp's call to
+    // handle_led_scripts() is commented out — and it assumes the 28-LED mask
+    // layout, so it is not what a 28..200-LED strip should show.
+    if (majora_led_count < 3)
+        return;
+
     static uint8_t step = 0; // From 0 to 127 positions
     uint8_t red = 0;
     uint8_t green = 0;
@@ -28,20 +36,20 @@ void run_majoras()
     uint16_t total = red + green + blue;
 
     // For eyes at address 27-28 (V1)
-    for (int i = 0; i < MAJORA_LEDS - 2; i++)
+    for (int i = 0; i < (int)majora_led_count - 2; i++)
     {
         if (i < 16) // Removes offset and dims for first 16 LEDs
             majora.setPixelColor(i, majora.Color(red / 5, green / 10, blue / 10));
         else
             majora.setPixelColor(i, majora.Color(red, green, blue));
     }
-    majora.setPixelColor(MAJORA_LEDS - 2, red, 0, 0);
-    majora.setPixelColor(MAJORA_LEDS - 1, red, 0, 0);
+    majora.setPixelColor(majora_led_count - 2, red, 0, 0);
+    majora.setPixelColor(majora_led_count - 1, red, 0, 0);
     /*
     // For eyes at address 00-01 (V2)
     majora.setPixelColor(0, red, 0, 0);
     majora.setPixelColor(1, red, 0, 0);
-        for (int i = 2; i < MAJORA_LEDS; i++)
+        for (int i = 2; i < (int)majora_led_count; i++)
     {
         if (i < 12) // Normal spikes
         majora.setPixelColor(i, majora.Color(red, green, blue));

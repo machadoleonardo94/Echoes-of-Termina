@@ -4,14 +4,14 @@
 //? ------------------------------------------------------------------------------------------
 //*! INMP441 microphone recording via I2S_NUM_1.
 //*! The A2DP sink occupies I2S_NUM_0 for speaker output; this peripheral is fully independent.
+//*! Both boards give the mic its own clock pins, so this setup works on either.
 //*!
-//*! Wiring:
-//*!   INMP441 VDD  → 3.3V
-//*!   INMP441 GND  → GND
-//*!   INMP441 L/R  → GND  (selects left channel)
-//*!   INMP441 SCK  → GPIO MIC_SCK (26)
-//*!   INMP441 WS   → GPIO MIC_WS  (27)
-//*!   INMP441 SD   → GPIO MIC_SD  (34)
+//*! The INMP441 requires SCK = 64 × WS, which is why the slots below are 32-bit —
+//*! at 16 kHz that is SCK = 1.024 MHz.
+//*!
+//*! Wiring (signal names as printed on the breakout):
+//*!   INMP441 VDD → 3.3V, GND → GND, L/R → GND (selects the left channel)
+//*!   INMP441 SCK → MIC_SCK, WS → MIC_WS, SD → MIC_SD
 //? ------------------------------------------------------------------------------------------
 
 #include "shared/dependencies.h"

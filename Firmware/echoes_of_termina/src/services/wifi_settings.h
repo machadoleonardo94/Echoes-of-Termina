@@ -86,7 +86,14 @@ bool setup_WIFI(bool portal_enabled)
                                   {
             Serial.println("Entered config mode");
             Serial.println(WiFi.softAPIP());
-            Serial.println(myWiFiManager->getConfigPortalSSID()); });
+            Serial.println(myWiFiManager->getConfigPortalSSID());
+            // The hotspot only exists when there is nothing to connect to, which is
+            // exactly the state a user cannot see: the board looks dead, and the phone
+            // in their hand is the thing that would fix it. A repeating two-note beacon
+            // says "come and configure me" without a screen. Played here rather than
+            // from setup_WIFI()'s return, because autoConnect() blocks for up to a
+            // minute and a cue after it would arrive a minute too late.
+            cue_play_now(CUE_AP_UP); });
 
         wifiManager.setSaveConfigCallback([]()
                                           { Serial.println("Should save config"); });
@@ -112,11 +119,18 @@ bool setup_WIFI(bool portal_enabled)
 
     if (!connected)
     {
+        // No network: announce it before mode_manager falls back to Bluetooth. The
+        // fallback then plays "bt-wait" straight after, so the user hears the whole
+        // story — "no WiFi" falling, then "I am a speaker now, waiting" rising.
+        cue_play_now(CUE_WIFI_FAIL);
         return false;
     }
 
     Serial.println("Connected to WiFi");
     Serial.println(WiFi.localIP());
+    // The board is reachable now, which is the one piece of information the portal
+    // address on a screen would have carried.
+    cue_play_now(CUE_WIFI_OK);
 
     // Save credentials
     saveCredentials(WiFi.SSID().c_str(), WiFi.psk().c_str());

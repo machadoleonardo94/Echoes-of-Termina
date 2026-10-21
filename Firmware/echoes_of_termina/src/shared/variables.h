@@ -17,18 +17,18 @@ uint32_t adcVoltage = 0;
 #define MAX_ADC_SAMPLES 8
 #define OVERSAMPLING_RESOLUTION 3 // 2^3 = 8 samples
 
-typedef struct buttonState
-{
-    bool currentState = LOW; // Last confirmed debounced state
-    bool lastState = LOW;    // Previous raw reading (used for debounce)
-    uint32_t lastDebounceTime = 0;
-    uint32_t debounceDelay = 50; // ms
-    uint8_t counter = 0;
-} struct_buttonState;
-
-struct_buttonState button_states;
+//* Button state lives in services/buttons.h now (one runtime struct per button,
+//* owned by the polling state machine). The old shared `struct_buttonState` with
+//* its single counter is gone with the single-button design.
 
 bool debugWifi = false;
+
+//* Addressable LED strip: live LED count, 1..MAJORA_MAX_LEDS.
+//* Set from NVS (or the compile-time default) by apply_led_config() in
+//* services/led_config.h, which runs in setup() before the strip is driven.
+//* Every loop, bound check and wildcard must use THIS, not MAJORA_MAX_LEDS:
+//* the max is only the array bound, while this is what is physically attached.
+uint16_t majora_led_count = MAJORA_LED_COUNT_DEFAULT;
 
 char macAdress[6] = {0, 0, 0, 0, 0, 0};
 
