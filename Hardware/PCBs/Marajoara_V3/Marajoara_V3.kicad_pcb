@@ -3431,7 +3431,7 @@
 			(remove_unused_layers no)
 			(net 58 "VCC")
 			(pintype "passive")
-			(uuid "2c30b226-8c4d-471c-8a0c-95764c490153")
+			(uuid "4af5bb6b-5045-4297-93d8-46ca53dd4413")
 		)
 		(pad "2" thru_hole circle
 			(at 1.778 0)
@@ -3450,7 +3450,7 @@
 			(roundrect_rratio 0.1)
 			(net 1 "GND")
 			(pintype "passive")
-			(uuid "da6dacaf-ac0f-48b1-8f77-bf7b0b9d8146")
+			(uuid "0e36b79d-519f-4b84-8563-e9211a2eaddb")
 		)
 		(embedded_fonts no)
 		(model "${KICAD9_3DMODEL_DIR}/Capacitor_SMD.3dshapes/CP_Elec_8x10.5.step"
@@ -18513,7 +18513,7 @@
 			(remove_unused_layers no)
 			(net 58 "VCC")
 			(pintype "passive")
-			(uuid "2eb9c3a3-edb6-4416-93db-32703323b527")
+			(uuid "898cd8d8-a52f-48b6-9898-fdd450db6f89")
 		)
 		(pad "2" thru_hole circle
 			(at 1.778 0 180)
@@ -18532,7 +18532,7 @@
 			(roundrect_rratio 0.1)
 			(net 1 "GND")
 			(pintype "passive")
-			(uuid "914579bb-17dd-487f-a529-2944ababe58b")
+			(uuid "289842ad-8726-4da7-a203-085663684472")
 		)
 		(embedded_fonts no)
 		(model "${KICAD9_3DMODEL_DIR}/Capacitor_SMD.3dshapes/CP_Elec_8x10.5.step"
@@ -25352,7 +25352,7 @@
 			(remove_unused_layers no)
 			(net 58 "VCC")
 			(pintype "passive")
-			(uuid "fa7438e9-7175-4073-a965-47e0db19d9a9")
+			(uuid "da29e1ee-7a6b-48b7-ab81-94192afd9ca3")
 		)
 		(pad "2" thru_hole circle
 			(at 1.778 0)
@@ -25371,7 +25371,7 @@
 			(roundrect_rratio 0.1)
 			(net 1 "GND")
 			(pintype "passive")
-			(uuid "2041e857-9cee-41ca-93f3-8ade25c25835")
+			(uuid "54f1c888-b3e2-4e5f-818e-a758682f3008")
 		)
 		(embedded_fonts no)
 		(model "${KICAD9_3DMODEL_DIR}/Capacitor_SMD.3dshapes/CP_Elec_8x10.5.step"
@@ -49662,7 +49662,7 @@
 			(justify left bottom)
 		)
 	)
-	(gr_text "Marajoara V2"
+	(gr_text "Marajoara V3"
 		(at 241.215708 57.2707 0)
 		(layer "F.SilkS")
 		(uuid "5287fb94-73e1-44d0-bd62-bc9f9b2cc5f4")

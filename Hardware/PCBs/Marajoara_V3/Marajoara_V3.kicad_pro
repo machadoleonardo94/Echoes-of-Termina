@@ -774,6 +774,18 @@
           "label": "Field6",
           "name": "Field6",
           "show": false
+        },
+        {
+          "group_by": false,
+          "label": "Mfr. Part Number",
+          "name": "Mfr. Part Number",
+          "show": false
+        },
+        {
+          "group_by": false,
+          "label": "Manufacturer ",
+          "name": "Manufacturer ",
+          "show": false
         }
       ],
       "filter_string": "",
