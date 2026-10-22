@@ -69,55 +69,55 @@ bool setup_SDCARD()
 // be pulled off the card to inspect.
 void updatefromSD()
 {
-    Serial.printf("[SD-OTA] Current firmware build: %d\n", FIRMWARE_BUILD);
+    Serial.printf("[SD-UPDATE] Current firmware build: %d\n", FIRMWARE_BUILD);
 
     File firmware = SD_MMC.open("/firmware.bin", FILE_READ);
     if (!firmware)
     {
-        Serial.println("[SD-OTA] No /firmware.bin on the SD card");
+        Serial.println("[SD-UPDATE] No /firmware.bin on the SD card");
         return;
     }
 
     size_t size = firmware.size();
-    Serial.printf("[SD-OTA] Found /firmware.bin: %u bytes\n", (unsigned)size);
+    Serial.printf("[SD-UPDATE] Found /firmware.bin: %u bytes\n", (unsigned)size);
     if (size == 0)
     {
         firmware.close();
-        Serial.println("[SD-OTA] Empty image — ignoring");
+        Serial.println("[SD-UPDATE] Empty image — ignoring");
         SD_MMC.rename("/firmware.bin", "/firmware.bad");
         return;
     }
 
     // Keep exactly one generation of backup.
     if (SD_MMC.remove("/firmware.bak"))
-        Serial.println("[SD-OTA] Old /firmware.bak removed");
+        Serial.println("[SD-UPDATE] Old /firmware.bak removed");
 
     if (!Update.begin(size, U_FLASH))
     {
         // Usual causes: the image is bigger than the target OTA slot, or the
         // partition table has no inactive slot to write.
-        Serial.printf("[SD-OTA] Update.begin failed: %s\n", Update.errorString());
+        Serial.printf("[SD-UPDATE] Update.begin failed: %s\n", Update.errorString());
         firmware.close();
         SD_MMC.rename("/firmware.bin", "/firmware.bad");
-        Serial.println("[SD-OTA] Left as /firmware.bad — continuing to boot the current image");
+        Serial.println("[SD-UPDATE] Left as /firmware.bad — continuing to boot the current image");
         return;
     }
 
     Update.onProgress(progresscallback);
     size_t written = Update.writeStream(firmware);
     firmware.close();
-    Serial.printf("[SD-OTA] Wrote %u of %u bytes\n", (unsigned)written, (unsigned)size);
+    Serial.printf("[SD-UPDATE] Wrote %u of %u bytes\n", (unsigned)written, (unsigned)size);
 
     if (!Update.end())
     {
-        Serial.printf("[SD-OTA] Update.end failed: %s\n", Update.errorString());
+        Serial.printf("[SD-UPDATE] Update.end failed: %s\n", Update.errorString());
         SD_MMC.rename("/firmware.bin", "/firmware.bad");
-        Serial.println("[SD-OTA] Left as /firmware.bad — NOT rebooting");
+        Serial.println("[SD-UPDATE] Left as /firmware.bad — NOT rebooting");
         return;
     }
 
     SD_MMC.rename("/firmware.bin", "/firmware.bak");
-    Serial.println("[SD-OTA] Update finished — rebooting into the new image");
+    Serial.println("[SD-UPDATE] Update finished — rebooting into the new image");
     delay(100); // let the serial lines above drain before the reset
     ESP.restart();
 }
@@ -133,7 +133,7 @@ void progresscallback(size_t currSize, size_t totalSize)
     if (bucket != last_bucket)
     {
         last_bucket = bucket;
-        Serial.printf("[SD-OTA] %d%%\n", bucket * 10);
+        Serial.printf("[SD-UPDATE] %d%%\n", bucket * 10);
     }
 }
 #endif // SETUP_SDCARD
