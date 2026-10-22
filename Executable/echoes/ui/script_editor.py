@@ -559,8 +559,10 @@ class MultiTrackEditorWidget(QWidget):
     different track in parallel without mixing them up.
 
     Public API (mirrors the ScriptEditor subset used by MainWindow):
-        set_tracks(dict[str, str])   — load all tracks, rebuild dropdowns
+        set_tracks(dict[str, str], labels=None) — load all tracks, rebuild dropdowns
+        set_track_labels(dict[str, str]) — replace the display labels
         get_tracks() -> dict         — return all tracks with live editor text
+        get_track_labels() -> dict   — per-track labels shown in the selector
         set_active_lines(int,set)— playing-note highlights to left editor
         follow_active_line()     — scroll left editor with the playhead
         set_error_lines(set)     — forward to left editor
@@ -575,12 +577,13 @@ class MultiTrackEditorWidget(QWidget):
 
     active_script_changed    = Signal(str)        # left track text changed
     background_script_changed = Signal(str, str)   # (track_name, text) right editor
-    tracks_changed            = Signal(list)        # list[str] track names changed
+    tracks_changed            = Signal(list, dict)  # (track names, per-slot labels)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
 
         self._tracks: dict[str, str] = {}
+        self._labels: dict[str, str] = {}   # human label shown beside the name
         self._left_track:  str = ''
         self._right_track: str = ''
 
@@ -680,42 +683,75 @@ class MultiTrackEditorWidget(QWidget):
         vbox.addWidget(self._splitter, 1)
 
         # ── Wiring ────────────────────────────────────────────────────────────
-        self._left_combo.currentTextChanged.connect(self._on_left_combo)
-        self._right_combo.currentTextChanged.connect(self._on_right_combo)
+        self._left_combo.currentIndexChanged.connect(self._on_left_combo)
+        self._right_combo.currentIndexChanged.connect(self._on_right_combo)
         self._split_btn.toggled.connect(self._on_split_toggled)
         self._left_editor.script_changed.connect(self._on_left_text_changed)
         self._right_editor.script_changed.connect(self._on_right_text_changed)
         self._refresh_slot_buttons()
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_tracks(self, tracks: dict[str, str]) -> None:
-        """Replace all tracks and rebuild the dropdowns."""
+    def set_tracks(self, tracks: dict[str, str],
+                   labels: dict[str, str] | None = None) -> None:
+        """
+        Replace all tracks and rebuild the dropdowns.
+
+        *labels* maps a track name to a human label shown in the selector
+        ("Slot 6 (Left side, Guitar)"). The track NAME stays the identity used
+        by engines, saves and section headers — the label is display-only.
+        """
         self._tracks = dict(tracks)
-        names = list(tracks.keys())
+        self._labels = {name: (labels or {}).get(name, '').strip()
+                        for name in self._tracks}
+        names = list(self._tracks)
 
-        for combo in (self._left_combo, self._right_combo):
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(names)
-            combo.blockSignals(False)
+        left  = names[0] if names else ''
+        right = names[1] if len(names) > 1 else left
 
-        self._left_track = names[0] if names else ''
-        self._left_editor.set_plain_text_silent(
-            tracks.get(self._left_track, ''))
-        self.active_script_changed.emit(
-            tracks.get(self._left_track, ''))
+        self._populate_combo(self._left_combo,  names, left)
+        self._populate_combo(self._right_combo, names, right)
 
-        # Pre-select a different track in the right editor when possible
-        right_idx = 1 if len(names) > 1 else 0
-        self._right_track = names[right_idx] if names else ''
-        self._right_combo.blockSignals(True)
-        self._right_combo.setCurrentIndex(right_idx)
-        self._right_combo.blockSignals(False)
-        self._right_editor.set_plain_text_silent(
-            tracks.get(self._right_track, ''))
+        self._left_track  = left
+        self._right_track = right
+        self._left_editor.set_plain_text_silent(self._tracks.get(left, ''))
+        self.active_script_changed.emit(self._tracks.get(left, ''))
+        self._right_editor.set_plain_text_silent(self._tracks.get(right, ''))
 
         self._refresh_slot_buttons()
-        self.tracks_changed.emit(names)
+        self.tracks_changed.emit(names, dict(self._labels))
+
+    def get_track_labels(self) -> dict[str, str]:
+        """Human labels shown beside each track name in the selector."""
+        return dict(self._labels)
+
+    def set_track_labels(self, labels: dict[str, str]) -> None:
+        """
+        Replace the display labels (Script Properties) without touching any
+        track text.  Emits tracks_changed so the toolbox follows along.
+        """
+        self._labels = {name: (labels.get(name, '') or '').strip()
+                        for name in self._tracks}
+        self._populate_combo(self._left_combo,  list(self._tracks), self._left_track)
+        self._populate_combo(self._right_combo, list(self._tracks), self._right_track)
+        self.tracks_changed.emit(list(self._tracks), dict(self._labels))
+
+    def _populate_combo(self, combo: 'QComboBox', names: list[str],
+                        current: str = '') -> None:
+        """Fill *combo* with display labels keyed by the bare track name."""
+        combo.blockSignals(True)
+        combo.clear()
+        for name in names:
+            combo.addItem(self._display_name(name), name)
+            combo.setItemData(combo.count() - 1, f'Track slot: {name}',
+                              Qt.ItemDataRole.ToolTipRole)
+        idx = combo.findData(current) if current else -1
+        combo.setCurrentIndex(idx if idx >= 0 else (0 if names else -1))
+        combo.blockSignals(False)
+
+    def _display_name(self, name: str) -> str:
+        """Selector text: the human label when set, else the stored name."""
+        label = (self._labels.get(name) or '').strip()
+        return label or name
 
     def get_tracks(self) -> dict[str, str]:
         """Return all tracks, syncing current editor contents first."""
@@ -821,13 +857,11 @@ class MultiTrackEditorWidget(QWidget):
         while name in self._tracks:
             name = f"{base} ({n})"; n += 1
         self._tracks[name] = ''
-        # Rebuild both combos
-        for combo in (self._left_combo, self._right_combo):
-            combo.blockSignals(True)
-            combo.addItem(name)
-            combo.blockSignals(False)
+        self._labels.setdefault(name, '')
+        self._populate_combo(self._left_combo,  list(self._tracks), self._left_track)
+        self._populate_combo(self._right_combo, list(self._tracks), self._right_track)
         self._refresh_slot_buttons()
-        self.tracks_changed.emit(list(self._tracks.keys()))
+        self.tracks_changed.emit(list(self._tracks), dict(self._labels))
 
     def _on_del_track(self) -> None:
         if len(self._tracks) <= 1 or not self._left_track:
@@ -841,26 +875,20 @@ class MultiTrackEditorWidget(QWidget):
         if ans != QMessageBox.StandardButton.Yes:
             return
         del self._tracks[self._left_track]
+        self._labels.pop(self._left_track, None)
         names = list(self._tracks.keys())
-        for combo in (self._left_combo, self._right_combo):
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(names)
-            combo.blockSignals(False)
-        self._left_track = names[0]
-        self._left_combo.setCurrentIndex(0)
+        self._left_track  = names[0]
+        self._right_track = names[1] if len(names) > 1 else names[0]
+        self._populate_combo(self._left_combo,  names, self._left_track)
+        self._populate_combo(self._right_combo, names, self._right_track)
         self._left_editor.set_plain_text_silent(self._tracks[self._left_track])
         self.active_script_changed.emit(self._left_editor.toPlainText())
-        right_idx = 1 if len(names) > 1 else 0
-        self._right_track = names[right_idx]
-        self._right_combo.blockSignals(True)
-        self._right_combo.setCurrentIndex(right_idx)
-        self._right_combo.blockSignals(False)
         self._right_editor.set_plain_text_silent(self._tracks[self._right_track])
         self._refresh_slot_buttons()
-        self.tracks_changed.emit(list(self._tracks.keys()))
+        self.tracks_changed.emit(names, dict(self._labels))
 
-    def _on_left_combo(self, new_name: str) -> None:
+    def _on_left_combo(self, idx: int) -> None:
+        new_name = self._left_combo.itemData(idx)
         if not new_name or new_name == self._left_track:
             return
         if self._left_track:
@@ -869,7 +897,8 @@ class MultiTrackEditorWidget(QWidget):
         self._left_editor.set_plain_text_silent(self._tracks.get(new_name, ''))
         self.active_script_changed.emit(self._left_editor.toPlainText())
 
-    def _on_right_combo(self, new_name: str) -> None:
+    def _on_right_combo(self, idx: int) -> None:
+        new_name = self._right_combo.itemData(idx)
         if not new_name or new_name == self._right_track:
             return
         if self._right_track:

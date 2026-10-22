@@ -14,11 +14,20 @@ MIDI format summary (from thenathannator.github.io/GuitarGame_ChartFormats)
 
 5-fret Expert note mapping
 ──────────────────────────
-  MIDI 96  → fret 0  (Green)
-  MIDI 97  → fret 1  (Red)
-  MIDI 98  → fret 2  (Yellow)
-  MIDI 99  → fret 3  (Blue)
-  MIDI 100 → fret 4  (Orange)
+  MIDI 96  → fret 0  (Guitar: Green)
+  MIDI 97  → fret 1  (Guitar: Red)
+  MIDI 98  → fret 2  (Guitar: Yellow)
+  MIDI 99  → fret 3  (Guitar: Blue)
+  MIDI 100 → fret 4  (Guitar: Orange)
+
+Drums (track name contains "DRUM")
+──────────────────────────────────
+  MIDI 96  → 6th-note cue (kick pedal)  — imported onto TrackConfig.cue_leds
+  MIDI 97  → fret 0  (red / snare)
+  MIDI 98  → fret 1  (yellow / hi-hat)
+  MIDI 99  → fret 2  (blue / ride)
+  MIDI 100 → fret 3  (green / crash)
+  MIDI 101 → fret 4  (5-lane green)
 
 Time conversion (same as .chart)
 ─────────────────────────────────
@@ -33,14 +42,15 @@ from dataclasses import dataclass, field
 from core.chart_importer import (
     MIN_FLASH_MS,
     TrackConfig,
-    _build_tempomap, _tick_to_ms, _fmt_time,
-    _fade_percent_for_black,
+    _add_note_commands, _build_tempomap, _tick_to_ms, import_header,
 )
 
-# ── Expert 5-fret MIDI note range ─────────────────────────────────────────────
+# ── Expert MIDI note range ────────────────────────────────────────────────────
 
-_EXPERT_MIN = 96   # Green  (fret 0)
-_EXPERT_MAX = 100  # Orange (fret 4)
+_EXPERT_MIN = 96    # guitar green (fret 0) / drums kick pedal
+_EXPERT_MAX = 101   # 5-lane green (5th drum lane); non-drum tracks stop at 100
+
+MIDI_PEDAL_NOTE = 96   # drums: kick pedal — imported as the 6th-note cue
 
 
 # ── Parsed MIDI file ──────────────────────────────────────────────────────────
@@ -51,7 +61,7 @@ class _MidiFile:
     sync:  list[tuple[int, int]]                # (tick, millibpm)
     ts_num: int = 4                             # initial time-sig numerator
     ts_den: int = 4                             # initial time-sig denominator
-    tracks: list[tuple[str, list]] = field(     # (name, [(tick, fret, dur)])
+    tracks: list[tuple[str, list]] = field(     # (name, [(tick, note_idx, dur)])
         default_factory=list)
 
 
@@ -109,7 +119,7 @@ def _parse(data: bytes) -> _MidiFile:
         # ── Parse one MTrk chunk ──────────────────────────────────────────────
         track_name  = ''
         note_on: dict[int, int] = {}                  # MIDI-note → start_tick
-        notes:   list[tuple[int, int, int]] = []      # (tick, fret, dur_ticks)
+        notes:   list[tuple[int, int, int]] = []      # (tick, note_idx, dur_ticks)
 
         abs_tick = 0
         status   = 0   # running-status byte
@@ -216,12 +226,15 @@ def _parse(data: bytes) -> _MidiFile:
 
 def get_midi_info(
     data: bytes,
-) -> tuple[dict[str, str], list[tuple[str, int]], float, int, int]:
+) -> tuple[dict[str, str], list[tuple[str, int, dict[int, int]]], float, int, int]:
     """
     Quick scan of a notes.mid binary.
 
     Returns (song_meta, tracks, initial_bpm, ts_num, ts_den) with the
-    same shape as chart_importer.get_chart_info().
+    same shape as chart_importer.get_chart_info(): each track entry is
+    ``(name, expert_note_count, cue_counts)``.  For drum tracks
+    ``cue_counts`` carries the pedal count under key ``96`` (the 6th note);
+    other instruments have no cue.
 
     song_meta only contains Resolution (and derived _Tempo/_TimeSig fields).
     The caller should augment it from song.ini the same way _import_chart does.
@@ -238,12 +251,32 @@ def get_midi_info(
 
     # Instrument tracks = those with at least one Expert note
     tracks = [
-        (name, len(notes))
+        (name, len(notes), _pedal_counts(name, notes))
         for name, notes in mid.tracks
         if notes
     ]
 
     return song_meta, tracks, initial_bpm, mid.ts_num, mid.ts_den
+
+
+def _pedal_counts(name: str, notes: list[tuple[int, int, int]]) -> dict[int, int]:
+    """{96: pedal hit count} for a drum track, {} otherwise."""
+    if 'DRUM' not in name.upper():
+        return {}
+    pedal = sum(1 for _t, idx, _d in notes if idx == 0)
+    return {MIDI_PEDAL_NOTE: pedal} if pedal else {}
+
+
+def _fret_for_note(note_idx: int, is_drum: bool) -> int | None:
+    """
+    Map a 96-based Expert note index to a 0-based fret lane.
+
+    Drums: index 0 (96, kick pedal) is the 6th-note cue and returns None;
+    lanes 97–101 become frets 0–4.  Other instruments: 96–100 are frets 0–4.
+    """
+    if is_drum:
+        return None if note_idx == 0 else (note_idx - 1 if note_idx <= 5 else None)
+    return note_idx if note_idx <= 4 else None
 
 
 def convert_midi_tracks_per_track(
@@ -255,6 +288,10 @@ def convert_midi_tracks_per_track(
 
     Returns (track_list, None) where track_list is a list of
     (track_name, script_body) for each enabled TrackConfig.
+
+    Drum tracks map the kick pedal onto the 6th-note cue (when
+    ``cfg.cue_leds`` is set) and lanes 97–101 onto frets 0–4; other
+    instruments map notes 96–100 onto frets 0–4 as before.
     """
     mid      = _parse(data)
     tempomap = _build_tempomap(mid.sync, mid.ticks)
@@ -269,11 +306,17 @@ def convert_midi_tracks_per_track(
         if not cfg.enabled:
             continue
 
-        fret_map = cfg.get_fret_map()
-        notes    = note_lookup.get(cfg.track_name, [])
+        is_drum    = 'DRUM' in cfg.track_name.upper()
+        fret_map   = cfg.get_fret_map()
+        notes      = note_lookup.get(cfg.track_name, [])
+        cue_events = ([ev for ev in notes if ev[1] == 0]
+                      if is_drum and cfg.cue_leds.strip() else [])
         cmd_lines: list[tuple[float, str]] = []
 
-        for tick, fret, dur_ticks in notes:
+        for tick, note_idx, dur_ticks in notes:
+            fret = _fret_for_note(note_idx, is_drum)
+            if fret is None:
+                continue
             leds = fret_map.get(fret, '').strip()
             if not leds:
                 continue
@@ -281,28 +324,15 @@ def convert_midi_tracks_per_track(
             start_ms = _tick_to_ms(tick, tempomap)
             end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
             dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
-            t        = _fmt_time(start_ms)
+            _add_note_commands(cmd_lines, start_ms, dur_ms, r, g, b, leds, cfg)
 
-            if dur_ms < cfg.short_ms:
-                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
-                                              cfg.fade_percent)
-                cmd_lines.append((
-                    start_ms,
-                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
-                ))
-            else:
-                cmd_lines.append((
-                    start_ms,
-                    f'{t}  SET {r} {g} {b}  {leds}'
-                ))
-                fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
-                t_avail = max(start_ms + dur_ms - fade_ms, 1)
-                pct = _fade_percent_for_black(max(r, g, b), t_avail,
-                                              cfg.fade_percent)
-                cmd_lines.append((
-                    fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
-                ))
+        for tick, _note_idx, dur_ticks in cue_events:
+            r, g, b  = cfg.cue_color
+            start_ms = _tick_to_ms(tick, tempomap)
+            end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
+            dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
+            _add_note_commands(cmd_lines, start_ms, dur_ms, r, g, b,
+                               cfg.cue_leds.strip(), cfg)
 
         cmd_lines.sort(key=lambda x: x[0])
         seen_at: dict[str, float] = {}
@@ -314,8 +344,8 @@ def convert_midi_tracks_per_track(
                 final.append(line)
                 seen_at[key] = ms
 
-        header_parts = ['# Imported from notes.mid', '']
-        body = '\n'.join(header_parts + final)
+        body = import_header('# Imported from notes.mid',
+                             cfg.mask_sector, cfg.track_name) + '\n' + '\n'.join(final)
         track_scripts.append((cfg.track_name, body))
 
     return track_scripts, None

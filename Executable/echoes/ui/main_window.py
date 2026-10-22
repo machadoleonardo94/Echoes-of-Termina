@@ -1309,11 +1309,15 @@ class MainWindow(QMainWindow):
             return
 
         merged = dict(existing)
-        for cfg, slot_name in preset_assignments:
+        labels = dict(self._editor.get_track_labels())
+        for cfg, slot_name, preset_label in preset_assignments:
             bodies = _convert([cfg])
             if bodies:
                 merged[slot_name] = bodies[0][1]
-        self._editor.set_tracks(merged)
+                # Human label for the selector: "<preset label>, <instrument>"
+                labels[slot_name] = self._compose_slot_label(
+                    preset_label, cfg.track_name)
+        self._editor.set_tracks(merged, labels)
         self._rebuild_engines()
 
         # ── Metadata ─────────────────────────────────────────────────────────────────
@@ -1571,7 +1575,8 @@ class MainWindow(QMainWindow):
         self._meta = self._parse_meta(text)
         self._sync_meta_to_transport()
         body = self._strip_meta(text)
-        self._editor.set_tracks(self._parse_tracks(body))
+        tracks, labels = self._parse_tracks(body)
+        self._editor.set_tracks(tracks, labels)
         self._rebuild_engines()
         self._script_path = path
         if title:
@@ -1676,7 +1681,8 @@ class MainWindow(QMainWindow):
         """
         self._refresh_auto_meta(path)
         text = (self._build_meta_header(self._meta)
-                + self._build_project_body(self._tracks_for_save()))
+                + self._build_project_body(self._tracks_for_save(),
+                                           self._editor.get_track_labels()))
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 fh.write(text)
@@ -2001,36 +2007,62 @@ class MainWindow(QMainWindow):
     # ── Properties dialog ────────────────────────────────────────────────
 
     def _show_properties(self) -> None:
-        dlg = MetadataDialog(self._meta, self)
+        dlg = MetadataDialog(self._meta,
+                             self._editor.get_track_labels(), self)
         if dlg.exec() != MetadataDialog.DialogCode.Accepted:
             return
         self._meta = dlg.get_meta()
+        self._editor.set_track_labels(dlg.get_track_labels())
         self._sync_meta_to_transport()
 
     # ── Metadata helpers ────────────────────────────────────────────────
 
     @staticmethod
-    def _parse_tracks(body: str) -> dict:
+    def _compose_slot_label(preset_label: str, source: str) -> str:
         """
-        Split a .echoes body into {track_name: body_text}.
+        Human label for a track slot: "zone (instrument)", e.g.
+        "Column + Eyes" + "PART DRUMS" -> "Column + Eyes (Drums)".
 
-        Track sections start with a bare ``[TrackName]`` header line — that is
-        how ``_build_project_body`` writes a project, so every track of a saved
-        project comes back as its own slot. Stray text before the first header
-        is kept as a leading 'Default' track, and a body with no headers at all
-        is a merged mask script, which loads as one 'Default' track.
+        The instrument is derived by the importers' shared helper, so MIDI
+        names ("PART GUITAR") and chart sections ("ExpertSingle") are handled
+        the same way as the "# Instrument:" comment they write.
+        """
+        from core.chart_importer import instrument_of
+        zone = (preset_label or '').strip()
+        instrument = instrument_of(source)
+        if zone and instrument:
+            return f'{zone} ({instrument})'
+        return zone or instrument or (source or '').strip()
+
+    @staticmethod
+    def _parse_tracks(body: str) -> tuple[dict[str, str], dict[str, str]]:
+        """
+        Split a .echoes body into ``({track_name: body_text}, {name: label})``.
+
+        Track sections start with a ``[TrackName]`` header line — that is how
+        ``_build_project_body`` writes a project, so every track of a saved
+        project comes back as its own slot. Anything after the closing bracket
+        is that track's human label ("[Slot 6] Left side, Guitar"), displayed
+        in the selector and never part of the track name. Stray text before the
+        first header is kept as a leading 'Default' track, and a body with no
+        headers at all is a merged mask script, which loads as one unlabelled
+        'Default' track.
         """
         tracks: dict[str, str] = {}
+        labels: dict[str, str] = {}
         current_name: str | None = None
         current_lines: list[str] = []
         preamble: list[str] = []
 
         for line in body.splitlines(keepends=True):
-            m = re.match(r'^\[([^\]]+)\]\s*$', line.strip())
+            m = re.match(r'^\[([^\]]+)\]\s*(.*)$', line.strip())
             if m:
                 if current_name is not None:
                     tracks[current_name] = ''.join(current_lines).strip('\n')
-                current_name = m.group(1)
+                current_name = m.group(1).strip()
+                label = m.group(2).strip()
+                if label:
+                    labels[current_name] = label
                 current_lines = []
             elif current_name is not None:
                 current_lines.append(line)
@@ -2047,26 +2079,33 @@ class MainWindow(QMainWindow):
             else:
                 tracks['Default'] = lead
 
-        return tracks
+        return tracks, labels
 
     @staticmethod
-    def _build_project_body(tracks: dict) -> str:
+    def _build_project_body(tracks: dict,
+                            labels: dict[str, str] | None = None) -> str:
         """
-        Serialise {track_name: body_text} as a human-readable project body:
-        one ``[TrackName]`` section per track, in editor order.
+        Serialise {track_name: body_text} (+ optional labels) as a
+        human-readable project body: one ``[TrackName]`` section per track,
+        in editor order.
 
-        This is the *editing* format — what "Save Script" writes. Tracks are
-        NOT merged: each section keeps its own timestamps from 0:00, which is
-        exactly what makes the file readable and re-openable with selectable
-        tracks. The firmware cannot play this layout; it gets the merged copy
-        produced by ``_build_mask_body`` ("Export to Mask" / "Upload Project").
+        A label is written after the header on the same line —
+        ``[Slot 6] Left side, Guitar`` — as the human name shown in the track
+        selector. It is not part of the track's identity, and the firmware
+        ignores ``[...]`` lines entirely. Tracks are NOT merged: each section
+        keeps its own timestamps from 0:00, which is exactly what makes the
+        file readable and re-openable with selectable tracks. The firmware
+        cannot play this layout; it gets the merged copy produced by
+        ``_build_mask_body`` ("Export to Mask" / "Upload Project").
         """
+        labels = labels or {}
         blocks: list[str] = []
         for name, body in tracks.items():
             clean = str(name).strip().replace('[', '').replace(']', '').strip()
             text  = (body or '').strip('\n').rstrip()
-            blocks.append(f"[{clean or 'Default'}]\n{text}" if text.strip()
-                          else f"[{clean or 'Default'}]")
+            label = (labels.get(name) or '').strip()
+            header = f"[{clean or 'Default'}]" + (f" {label}" if label else '')
+            blocks.append(f"{header}\n{text}" if text.strip() else header)
         return '\n\n'.join(blocks) + '\n' if blocks else ''
 
     @staticmethod

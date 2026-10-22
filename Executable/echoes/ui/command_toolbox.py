@@ -390,20 +390,32 @@ class CommandToolbox(QWidget):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def set_track_names(self, names: list[str]) -> None:
-        """Repopulate the target slot dropdown, preserving the current selection."""
-        current = self._slot_combo.currentText()
+    def set_track_names(self, names: list[str],
+                        labels: dict[str, str] | None = None) -> None:
+        """
+        Repopulate the target slot dropdown, preserving the current selection.
+
+        *labels* is the per-slot display label (``name (label)``); the stored
+        item data stays the bare track name so inserts target the right slot.
+        """
+        labels = labels or {}
+        current = self._slot_combo.currentData() or self._slot_combo.currentText()
         self._slot_combo.blockSignals(True)
         self._slot_combo.clear()
-        self._slot_combo.addItems(names)
-        idx = self._slot_combo.findText(current)
+        for name in names:
+            label = (labels.get(name) or '').strip()
+            self._slot_combo.addItem(label or name, name)
+            self._slot_combo.setItemData(self._slot_combo.count() - 1,
+                                         f'Target track: {name}',
+                                         Qt.ItemDataRole.ToolTipRole)
+        idx = self._slot_combo.findData(current)
         if idx >= 0:
             self._slot_combo.setCurrentIndex(idx)
         self._slot_combo.blockSignals(False)
 
     def current_target_track(self) -> str:
         """Return the currently selected target slot name."""
-        return self._slot_combo.currentText()
+        return self._slot_combo.currentData() or ''
 
     def set_macros(self, macros: list[dict]) -> None:
         """

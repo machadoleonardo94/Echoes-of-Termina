@@ -1,7 +1,7 @@
 """
 Chart import configuration dialog.
 
-Displays the [Song] metadata from a .chart file and presents one
+Displays the [Song] metadata from a .chart/.mid file and presents one
 configuration block per detected note track.  Per-track settings:
 
   • enabled / disabled
@@ -10,6 +10,7 @@ configuration block per detected note track.  Per-track settings:
   • short-note threshold  (ms)
   • fade decay rate  (% / second)
   • fade-lead time  (ms before a sustained note ends)
+  • 6th-note cue  (LED spec + colour for the drum pedal — empty = ignore it)
 
 Last-used values are persisted to ~/.echoes/import_prefs.json and
 restored the next time the dialog opens (per track position, 0-3).
@@ -87,6 +88,11 @@ def _dim(text: str) -> QLabel:
     return lbl
 
 
+def _cue_note_label(n: int) -> str:
+    """Human label for a cue note number (the drum pedal has two forms)."""
+    return 'pedal' if n in (0, 96) else str(n)
+
+
 # ── Preset configuration block ────────────────────────────────────────────────
 
 class _PresetRow(QWidget):
@@ -100,6 +106,9 @@ class _PresetRow(QWidget):
       Source  — which chart track feeds this preset  ("— None —" = skip)
       → Slot  — which project slot receives the output
 
+    A sixth "Cue" LED box maps the drum pedal (kick — the 6th note) onto its
+    own LEDs; the five playable lanes stay on the five frets.
+
     The LED / colour / timing settings are saved by preset index so they
     survive across imports of different files.
     """
@@ -110,10 +119,12 @@ class _PresetRow(QWidget):
         available_tracks: list[str],
         slot_names:       list[str],
         prefs:            dict | None,
+        cue_info:         dict[str, dict[int, int]] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self._preset_idx = preset_idx
+        self._cue_info   = cue_info or {}
 
         # ── initial values from prefs or defaults ─────────────────────────────
         default_preset = _DEFAULT_PRESETS[preset_idx % len(_DEFAULT_PRESETS)]
@@ -132,6 +143,10 @@ class _PresetRow(QWidget):
             init_fade  = prefs.get('fade_percent',  80)
             init_lead  = prefs.get('fade_lead_ms', 400)
             init_label = str(prefs.get('label', f'Preset {preset_idx + 1}'))
+            init_cue   = str(prefs.get('cue_leds', ''))
+            cue_raw    = prefs.get('cue_color', [255, 255, 255])
+            self._cue_color = QColor(*cue_raw) if isinstance(cue_raw, (list, tuple)) \
+                and len(cue_raw) == 3 else QColor(255, 255, 255)
         else:
             self._fret_colors = {f: QColor(*rgb) for f, rgb in GH_FRET_COLORS.items()}
             init_leds  = default_leds
@@ -139,6 +154,8 @@ class _PresetRow(QWidget):
             init_fade  = 80
             init_lead  = 400
             init_label = f'Preset {preset_idx + 1}'
+            init_cue   = ''
+            self._cue_color = QColor(255, 255, 255)
 
         # ── outer layout ──────────────────────────────────────────────────────
         outer = QVBoxLayout(self)
@@ -282,8 +299,40 @@ class _PresetRow(QWidget):
 
             frow.addWidget(cell)
 
+        # ── 6th-note cue cell (drums tom markers / .chart 5-lane green) ────
+        cue_cell = QWidget()
+        cue_cell.setStyleSheet("background:transparent;")
+        ccv = QVBoxLayout(cue_cell)
+        ccv.setContentsMargins(0, 0, 0, 0)
+        ccv.setSpacing(3)
+
+        self._cue_lbl = QLabel("Cue")
+        self._cue_lbl.setStyleSheet("color:#777; font:9px 'Segoe UI';")
+        self._cue_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        ccv.addWidget(self._cue_lbl)
+
+        self._cue_led = QLineEdit(init_cue)
+        self._cue_led.setFixedWidth(72)
+        self._cue_led.setPlaceholderText("off")
+        self._cue_led.setToolTip(
+            "Optional 6th-note cue \u2014 the drum pedal (kick).\n"
+            "Same LED syntax as the frets.  Empty = ignore the pedal.")
+        self._cue_btn = QPushButton("6")
+        self._cue_btn.setFixedSize(26, 22)
+        self._cue_btn.setToolTip("Cue colour \u2014 click to change")
+        self._cue_btn.clicked.connect(self._pick_cue_color)
+
+        cue_row = QHBoxLayout()
+        cue_row.setContentsMargins(0, 0, 0, 0)
+        cue_row.setSpacing(4)
+        cue_row.addWidget(self._cue_btn)
+        cue_row.addWidget(self._cue_led)
+        ccv.addLayout(cue_row)
+        frow.addWidget(cue_cell)
+
         frow.addStretch()
         self._refresh_all_btns()
+        self._refresh_cue_btn()
         outer.addWidget(frets_widget)
 
         # initial preset selection
@@ -293,7 +342,7 @@ class _PresetRow(QWidget):
         # Controls that follow source selection
         self._cfg_controls: list[QWidget] = (
             [self._slot_combo, self._preset] + self._led_inputs + self._fret_btns +
-            [self._short, self._fade, self._lead]
+            [self._short, self._fade, self._lead, self._cue_led, self._cue_btn]
         )
         self._source_combo.currentIndexChanged.connect(self._on_source_changed)
         self._on_source_changed()   # set initial enabled state
@@ -305,6 +354,26 @@ class _PresetRow(QWidget):
         enabled = self._source_combo.currentData() is not None
         for w in self._cfg_controls:
             w.setEnabled(enabled)
+        self._refresh_cue_hint(self._source_combo.currentData())
+
+    def _refresh_cue_hint(self, source: str | None) -> None:
+        """Label the cue cell with the pedal hits found in *source*."""
+        counts = self._cue_info.get(source or '', {}) if source else {}
+        if counts:
+            total = sum(counts.values())
+            notes = ', '.join(_cue_note_label(n) for n in sorted(counts))
+            detail = ', '.join(f'{_cue_note_label(n)} {c} hits'
+                               for n, c in sorted(counts.items()))
+            self._cue_lbl.setText(f'Cue {notes}')
+            self._cue_led.setToolTip(
+                "6th-note cue LED spec.\n"
+                f"Detected in this track: {detail}.\n"
+                "Empty = ignore the pedal.  Same LED syntax as the frets.")
+        else:
+            self._cue_lbl.setText('Cue')
+            self._cue_led.setToolTip(
+                "Optional 6th-note cue \u2014 the drum pedal (kick).\n"
+                "Empty = ignore the pedal.  Same LED syntax as the frets.")
 
     # ── Preset / LED sync ─────────────────────────────────────────────────────
 
@@ -374,6 +443,29 @@ class _PresetRow(QWidget):
         for fret in range(5):
             self._refresh_fret_btn(fret)
 
+    # ── Cue colour button ─────────────────────────────────────────────────────
+
+    def _pick_cue_color(self) -> None:
+        c = QColorDialog.getColor(self._cue_color, self, "Cue  Colour")
+        if c.isValid():
+            self._cue_color = c
+            self._refresh_cue_btn()
+
+    def _refresh_cue_btn(self) -> None:
+        c   = self._cue_color
+        lum = 0.299 * c.red() + 0.587 * c.green() + 0.114 * c.blue()
+        txt = "#000" if lum > 140 else "#fff"
+        self._cue_btn.setStyleSheet(
+            f"QPushButton {{"
+            f"  background:{c.name()}; border:1px solid #555;"
+            f"  border-radius:3px; color:{txt}; font:bold 9px 'Segoe UI';"
+            f"}}"
+            f"QPushButton:hover {{ border-color:#007acc; }}"
+        )
+        self._cue_btn.setToolTip(
+            f"Cue  \u2014  rgb({c.red()}, {c.green()}, {c.blue()})"
+            f"  \u2014  click to change")
+
     # ── Public interface ──────────────────────────────────────────────────────
 
     def get_config(self) -> 'TrackConfig | None':
@@ -395,10 +487,19 @@ class _PresetRow(QWidget):
             short_ms     = self._short.value(),
             fade_percent = self._fade.value(),
             fade_lead_ms = self._lead.value(),
+            cue_leds     = self._cue_led.text().strip(),
+            cue_color    = (self._cue_color.red(),
+                            self._cue_color.green(),
+                            self._cue_color.blue()),
+            mask_sector  = self.get_label(),
         )
 
     def get_slot_target(self) -> str:
         return self._slot_combo.currentText()
+
+    def get_label(self) -> str:
+        """Preset label (the zone name shown on this row)."""
+        return self._label.text().strip() or f'Preset {self._preset_idx + 1}'
 
     def get_prefs(self) -> dict:
         """Serializable snapshot of LED / colour / timing settings for persistence."""
@@ -414,6 +515,10 @@ class _PresetRow(QWidget):
             'short_ms':     self._short.value(),
             'fade_percent': self._fade.value(),
             'fade_lead_ms': self._lead.value(),
+            'cue_leds':     self._cue_led.text().strip(),
+            'cue_color':    [self._cue_color.red(),
+                             self._cue_color.green(),
+                             self._cue_color.blue()],
         }
 
     def apply_prefs(self, prefs: dict) -> None:
@@ -433,6 +538,15 @@ class _PresetRow(QWidget):
             for f, inp in enumerate(self._led_inputs):
                 if f < len(saved_leds):
                     inp.setText(str(saved_leds[f]))
+        cue_led = prefs.get('cue_leds')
+        if cue_led is not None:
+            self._cue_led.setText(str(cue_led))
+        cue_raw = prefs.get('cue_color')
+        if isinstance(cue_raw, (list, tuple)) and len(cue_raw) == 3:
+            try:
+                self._cue_color = QColor(*cue_raw)
+            except (TypeError, ValueError):
+                pass
         try:
             self._short.setValue(int(prefs.get('short_ms', self._short.value())))
             self._fade.setValue(int(prefs.get('fade_percent', self._fade.value())))
@@ -443,6 +557,7 @@ class _PresetRow(QWidget):
         if label:
             self._label.setText(label)
         self._refresh_all_btns()
+        self._refresh_cue_btn()
         self._sync_preset_combo([inp.text().strip() for inp in self._led_inputs])
 
 
@@ -461,13 +576,13 @@ class ChartImportDialog(QDialog):
     def __init__(
         self,
         song_meta:  dict[str, str],
-        tracks:     list[tuple[str, int]],
+        tracks:     list[tuple[str, int, dict[int, int]]],
         parent=None,
         slot_names: list[str] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Import Tracks")
-        self.setMinimumWidth(720)
+        self.setMinimumWidth(800)
         self.setStyleSheet("background:#1e1e1e; " + _BASE)
 
         if not slot_names:
@@ -513,7 +628,10 @@ class ChartImportDialog(QDialog):
 
         # ── Info label ────────────────────────────────────────────────────────
         n = len(tracks)
-        available_tracks = [name for name, _ in tracks]
+        available_tracks = [t[0] for t in tracks]
+        cue_info = {
+            t[0]: (t[2] if len(t) > 2 else {}) for t in tracks
+        }
         info_lbl = QLabel(
             f"Tracks found in file: {n}  \u2014  "
             "assign source tracks to the 6 preset slots below"
@@ -522,6 +640,21 @@ class ChartImportDialog(QDialog):
         )
         info_lbl.setStyleSheet("color:#aaa; font:bold 11px 'Segoe UI';")
         root.addWidget(info_lbl)
+
+        # ── Extra ("6th") note summary ───────────────────────────────────────
+        cue_parts = [
+            f'{t[0]}: ' + ', '.join(
+                f'{_cue_note_label(n_)} {c} hits'
+                for n_, c in sorted(t[2].items()))
+            for t in tracks if len(t) > 2 and t[2]
+        ]
+        if cue_parts:
+            cue_lbl = QLabel(
+                "Pedal (6th note) found \u2014 " + ';  '.join(cue_parts) +
+                "\nSet the Cue LEDs on that preset to import it as its own cue.")
+            cue_lbl.setWordWrap(True)
+            cue_lbl.setStyleSheet("color:#777; font:10px 'Segoe UI';")
+            root.addWidget(cue_lbl)
 
         # ── Preset rows (always MAX_TRACKS) ───────────────────────────────────
         prefs = _load_prefs()
@@ -550,7 +683,8 @@ class ChartImportDialog(QDialog):
 
         self._rows: list[_PresetRow] = []
         for i in range(MAX_TRACKS):
-            row = _PresetRow(i, available_tracks, slot_names, prefs.get(f'track_{i}'), inner)
+            row = _PresetRow(i, available_tracks, slot_names,
+                             prefs.get(f'track_{i}'), cue_info, inner)
             inner_layout.addWidget(row)
             if i < MAX_TRACKS - 1:
                 sep = QFrame()
@@ -680,18 +814,21 @@ class ChartImportDialog(QDialog):
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def get_preset_assignments(self) -> list[tuple['TrackConfig', str]]:
+    def get_preset_assignments(self) -> list[tuple['TrackConfig', str, str]]:
         """
-        Return ``[(TrackConfig, slot_name)]`` for each enabled preset row.
+        Return ``[(TrackConfig, slot_name, preset_label)]`` for each enabled
+        preset row.
 
         A row is enabled when its Source dropdown is not "— None —".
-        The same source track may appear in multiple rows (different LED configs).
+        The same source track may appear in multiple rows (different LED
+        configurations). The preset label is composed into the slot's human
+        label by the caller ("Left side, Guitar").
         """
         result = []
         for row in self._rows:
             cfg = row.get_config()
             if cfg is not None:
-                result.append((cfg, row.get_slot_target()))
+                result.append((cfg, row.get_slot_target(), row.get_label()))
         return result
 
     def wants_metadata(self) -> bool:

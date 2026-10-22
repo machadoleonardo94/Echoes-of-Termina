@@ -23,6 +23,13 @@ Note handling
   The FADE percent is computed per note so the LED reaches black exactly when
   the note ends (the LED brightness matches the note timeline).  Notes too
   short for even the fastest decay (99 %/s) fall back to 99 %.
+
+6th-note cue (optional)
+───────────────────────
+  Drum charts carry a pedal (kick) as their 6th input.  In .chart drums that
+  is note 0 and the five playable lanes are notes 1–5 (note 5 = 5-lane green).
+  When TrackConfig.cue_leds is set, the pedal drives its own LED spec/colour
+  with the same short/long FADE/SET rules, and lanes 1–5 map to frets 0–4.
 """
 from __future__ import annotations
 
@@ -65,9 +72,95 @@ def _fade_percent_for_black(max_val: int, t_ms: float, fallback: int) -> int:
     pct = max(pct, max(1, min(99, fallback)))
     return max(1, min(99, pct))
 
+
+_CHART_SECTION_RE = re.compile(r'^(?:Easy|Medium|Hard|Expert)', re.IGNORECASE)
+
+
+def instrument_of(track_name: str) -> str:
+    """
+    Instrument part of a chart/MIDI track name.
+
+    "PART DRUMS" -> "Drums", "PART GUITAR" -> "Guitar", "Drums - Center bar"
+    -> "Drums". A .chart section name ("ExpertSingle") returns '' — that is a
+    difficulty+lane label, not an instrument, so callers omit the line rather
+    than invent one.
+    """
+    name = (track_name or '').strip()
+    if not name:
+        return ''
+    if _CHART_SECTION_RE.match(name):
+        return ''
+    # Clone Hero / Rock Band MIDI names: "PART GUITAR", "PART DRUMS", ...
+    name = re.sub(r'^PART\s+', '', name, flags=re.IGNORECASE).strip()
+    if not name:
+        return ''
+    parts = re.split(r'\s*[-\u2013/]\s*', name, maxsplit=1)
+    inst = parts[0].strip()
+    # Upper-case MIDI names read as shouting in the UI: "DRUMS" -> "Drums".
+    if inst.isupper() and inst.replace('_', '').isalpha():
+        inst = inst.replace('_', ' ').title().strip()
+    return inst
+
+
+def import_header(imported_line: str, mask_sector: str, track_name: str) -> str:
+    """
+    Comment block at the top of an imported track body.
+
+    The provenance line ("# Imported from ...") comes first, then
+    ``# Mask sector:`` and ``# Instrument:`` so the saved project documents
+    which slot the track came from and what played it. A blank line separates
+    the comments from the commands; lines the importer cannot know are left out.
+    """
+    lines = [imported_line]
+    sector = (mask_sector or '').strip()
+    if sector:
+        lines.append(f'# Mask sector: {sector}')
+        inst = instrument_of(track_name)
+        if inst:
+            lines.append(f'# Instrument: {inst}')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def _add_note_commands(
+    cmd_lines: list[tuple[float, str]],
+    start_ms:  float,
+    dur_ms:    float,
+    r: int, g: int, b: int,
+    leds:      str,
+    cfg:       'TrackConfig',
+) -> None:
+    """
+    Append the SET/FADE command(s) for one note or cue hit.
+
+    Short hits become a single FADE flash; longer notes get SET at the start
+    plus a FADE that reaches black as the note ends (both shared by the fret
+    lanes and the 6th-note cue column).
+    """
+    t = _fmt_time(start_ms)
+    if dur_ms < cfg.short_ms:
+        pct = _fade_percent_for_black(max(r, g, b), dur_ms, cfg.fade_percent)
+        cmd_lines.append((start_ms, f'{t}  FADE {r} {g} {b} {pct}  {leds}'))
+    else:
+        cmd_lines.append((start_ms, f'{t}  SET {r} {g} {b}  {leds}'))
+        fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
+        t_avail = max(start_ms + dur_ms - fade_ms, 1)
+        pct = _fade_percent_for_black(max(r, g, b), t_avail, cfg.fade_percent)
+        cmd_lines.append((
+            fade_ms,
+            f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}',
+        ))
+
+
 # ── Fret / LED presets ────────────────────────────────────────────────────────
 
 VALID_FRETS: frozenset[int] = frozenset({0, 1, 2, 3, 4})
+
+# `.chart` drum cue note — the kick pedal (the "6th note" the 5-fret mapping
+# does not consume).  Drum sections chart the five playable lanes as notes 1–5
+# (note 5 = 5-lane green), with the pedal as note 0.  Cymbal/tom modifiers
+# (66/67/68) are markers, not notes, so they never drive the cue.
+CHART_DRUM_CUE_NOTE: int = 0
 
 # Named presets for fret → LED mapping.
 # LED order: central (1–16), spikes (17–26), eyes (27–28)
@@ -102,6 +195,14 @@ class TrackConfig:
     short_ms:     int  = SHORT_MS
     fade_percent: int  = FADE_PERCENT
     fade_lead_ms: int  = FADE_LEAD_MS
+    # 6th ("cue") note — tom markers in .mid / cymbal modifiers + 5-lane
+    # green in .chart.  Empty LED spec = disabled (the default, so existing
+    # imports are unchanged).
+    cue_leds:     str  = ''
+    cue_color:    tuple[int, int, int] = (255, 255, 255)
+    # Preset (mask sector) name this track is imported onto — written into the
+    # body as "# Mask sector:" for the saved project and the selector label.
+    mask_sector:  str  = ''
 
     def get_fret_map(self) -> dict[int, str]:
         return self.fret_leds
@@ -114,15 +215,17 @@ class TrackConfig:
 
 def get_chart_info(
     text: str,
-) -> tuple[dict[str, str], list[tuple[str, int]], float, int, int]:
+) -> tuple[dict[str, str], list[tuple[str, int, dict[int, int]]], float, int, int]:
     """
     Quick scan of a .chart file.
 
     Returns
     -------
     song_meta    : dict  — {key: value} from [Song]
-    tracks       : list  — (section_name, note_count) in file order,
-                           only sections that contain playable N entries (frets 0–4)
+    tracks       : list  — (section_name, note_count, cue_counts) in file
+                           order, only sections that contain playable N
+                           entries.  ``cue_counts`` maps the drum pedal
+                           (note 0) to its hit count in drum sections.
     initial_bpm  : float — BPM at tick 0 from [SyncTrack] (default 120.0)
     ts_num       : int   — time-signature numerator at tick 0 (default 4)
     ts_den       : int   — time-signature denominator at tick 0 (default 4)
@@ -137,6 +240,7 @@ def get_chart_info(
     song_meta:   dict[str, str] = {}
     track_order: list[str]      = []
     note_counts: dict[str, int] = {}
+    cue_counts:  dict[str, dict[int, int]] = {}
 
     initial_bpm = 120.0
     ts_num      = 4
@@ -183,7 +287,21 @@ def get_chart_info(
 
         elif section and section != 'SyncTrack':
             m = re.match(r'^\d+\s*=\s*N\s+(\d+)\s+\d+$', line)
-            if m and int(m.group(1)) in VALID_FRETS:
+            if not m:
+                continue
+            note = int(m.group(1))
+            drums = 'drums' in section.lower()
+            if drums:
+                if note == CHART_DRUM_CUE_NOTE:
+                    # pedal — the 6th-note cue
+                    entry = cue_counts.setdefault(section, {})
+                    entry[CHART_DRUM_CUE_NOTE] = entry.get(CHART_DRUM_CUE_NOTE, 0) + 1
+                elif 1 <= note <= 5:
+                    if section not in note_counts:
+                        note_counts[section] = 0
+                        track_order.append(section)
+                    note_counts[section] += 1
+            elif note in VALID_FRETS:
                 if section not in note_counts:
                     note_counts[section] = 0
                     track_order.append(section)
@@ -191,7 +309,7 @@ def get_chart_info(
 
     return (
         song_meta,
-        [(n, note_counts[n]) for n in track_order],
+        [(n, note_counts[n], cue_counts.get(n, {})) for n in track_order],
         initial_bpm,
         ts_num,
         ts_den,
@@ -231,7 +349,14 @@ def _parse_song_and_sync(text: str) -> tuple[dict[str, str], list[tuple[int, int
 def _parse_notes_for_section(
     text: str, section_name: str
 ) -> list[tuple[int, int, int]]:
-    """Return (tick, fret, dur_ticks) for playable notes in *section_name*."""
+    """Return (tick, fret, dur_ticks) for playable notes in *section_name*.
+
+    Drum sections chart their five playable lanes as notes 1–5 (note 5 =
+    5-lane green), so those map to frets 0–4; the pedal (note 0) is handled
+    by :func:`_parse_cue_notes_for_section`.  Other sections map notes 0–4
+    straight onto frets 0–4.
+    """
+    drums = 'drums' in section_name.lower()
     entries: list[tuple[int, int, int]] = []
     section: str | None = None
 
@@ -250,9 +375,47 @@ def _parse_notes_for_section(
         if section == section_name:
             m = re.match(r'^(\d+)\s*=\s*N\s+(\d+)\s+(\d+)$', line)
             if m:
-                tick, fret, dur = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                if fret in VALID_FRETS:
-                    entries.append((tick, fret, dur))
+                tick, note, dur = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if drums:
+                    if 1 <= note <= 5:
+                        entries.append((tick, note - 1, dur))
+                elif note in VALID_FRETS:
+                    entries.append((tick, note, dur))
+
+    return entries
+
+
+def _parse_cue_notes_for_section(
+    text: str, section_name: str
+) -> list[tuple[int, int, int]]:
+    """Return (tick, note, dur_ticks) for the pedal cue in *section_name*.
+
+    Only drum sections are considered: in a guitar section ``N 0`` is the
+    green fret, not a pedal.
+    """
+    if 'drums' not in section_name.lower():
+        return []
+    entries: list[tuple[int, int, int]] = []
+    section: str | None = None
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        m = re.match(r'^\[(\w+)\]$', line)
+        if m:
+            section = m.group(1)
+            continue
+        if line in ('{', '}'):
+            if line == '}':
+                section = None
+            continue
+        if section == section_name:
+            m = re.match(r'^(\d+)\s*=\s*N\s+(\d+)\s+(\d+)$', line)
+            if m:
+                tick, note, dur = int(m.group(1)), int(m.group(2)), int(m.group(3))
+                if note == CHART_DRUM_CUE_NOTE:
+                    entries.append((tick, note, dur))
 
     return entries
 
@@ -335,6 +498,8 @@ def convert_tracks_per_track(
 
         fret_map     = cfg.get_fret_map()
         note_entries = _parse_notes_for_section(chart_text, cfg.track_name)
+        cue_entries  = (_parse_cue_notes_for_section(chart_text, cfg.track_name)
+                        if cfg.cue_leds.strip() else [])
         cmd_lines: list[tuple[float, str]] = []
 
         for tick, fret, dur_ticks in note_entries:
@@ -345,29 +510,15 @@ def convert_tracks_per_track(
             start_ms = _tick_to_ms(tick, tempomap)
             end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
             dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
-            leds     = fret_map[fret]
-            t        = _fmt_time(start_ms)
+            _add_note_commands(cmd_lines, start_ms, dur_ms, r, g, b, leds, cfg)
 
-            if dur_ms < cfg.short_ms:
-                pct = _fade_percent_for_black(max(r, g, b), dur_ms,
-                                              cfg.fade_percent)
-                cmd_lines.append((
-                    start_ms,
-                    f'{t}  FADE {r} {g} {b} {pct}  {leds}'
-                ))
-            else:
-                cmd_lines.append((
-                    start_ms,
-                    f'{t}  SET {r} {g} {b}  {leds}'
-                ))
-                fade_ms = max(start_ms + dur_ms - cfg.fade_lead_ms, start_ms + 50)
-                t_avail = max(start_ms + dur_ms - fade_ms, 1)
-                pct = _fade_percent_for_black(max(r, g, b), t_avail,
-                                              cfg.fade_percent)
-                cmd_lines.append((
-                    fade_ms,
-                    f'{_fmt_time(fade_ms)}  FADE {r} {g} {b} {pct}  {leds}'
-                ))
+        for tick, _note, dur_ticks in cue_entries:
+            r, g, b  = cfg.cue_color
+            start_ms = _tick_to_ms(tick, tempomap)
+            end_ms   = _tick_to_ms(tick + dur_ticks, tempomap)
+            dur_ms   = max(end_ms - start_ms, MIN_FLASH_MS)
+            _add_note_commands(cmd_lines, start_ms, dur_ms, r, g, b,
+                               cfg.cue_leds.strip(), cfg)
 
         cmd_lines.sort(key=lambda x: x[0])
         seen_at: dict[str, float] = {}
@@ -379,8 +530,8 @@ def convert_tracks_per_track(
                 final.append(line)
                 seen_at[key] = ms
 
-        header_parts = ['# Imported from Clone Hero .chart', '']
-        body = '\n'.join(header_parts + final)
+        body = import_header('# Imported from Clone Hero .chart',
+                             cfg.mask_sector, cfg.track_name) + '\n' + '\n'.join(final)
         track_scripts.append((cfg.track_name, body))
 
     return track_scripts, audio_file

@@ -45,7 +45,8 @@ _TIME_SIGNATURES = [
 class MetadataDialog(QDialog):
     """Modal dialog for viewing and editing .echoes file metadata."""
 
-    def __init__(self, meta: dict, parent=None) -> None:
+    def __init__(self, meta: dict, track_labels: dict[str, str] | None = None,
+                 parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Script Properties")
         self.setMinimumWidth(500)
@@ -91,21 +92,18 @@ class MetadataDialog(QDialog):
         else:
             self._timesig.setCurrentText(current_ts)
 
-        self._track1 = QLineEdit(meta.get('track1', ''))
-        self._track1.setPlaceholderText("e.g. ExpertSingle")
-        self._track1.setToolTip("Label for the first imported chart track")
-
-        self._track2 = QLineEdit(meta.get('track2', ''))
-        self._track2.setPlaceholderText("e.g. ExpertDoubleBass")
-        self._track2.setToolTip("Label for the second imported chart track")
-
-        self._track3 = QLineEdit(meta.get('track3', ''))
-        self._track3.setPlaceholderText("optional")
-        self._track3.setToolTip("Label for the third imported chart track")
-
-        self._track4 = QLineEdit(meta.get('track4', ''))
-        self._track4.setPlaceholderText("optional")
-        self._track4.setToolTip("Label for the fourth imported chart track")
+        # Per-slot display labels, shown after the track name in the selector.
+        # The importer pre-fills "<preset label>, <instrument>". The legacy
+        # fixed Track 1-4 (@trackN) fields are retired: any @trackN values
+        # already in the file pass through ``get_meta`` untouched.
+        self._track_edits: dict[str, QLineEdit] = {}
+        for name, label in (track_labels or {}).items():
+            edit = QLineEdit(str(label or ''))
+            edit.setPlaceholderText("e.g. Left side, Guitar")
+            edit.setToolTip(
+                "Shown after the track name in the track selector.\n"
+                "The importer fills this from the preset label and source track.")
+            self._track_edits[name] = edit
 
         self._duration = QLineEdit(meta.get('duration', ''))
         self._duration.setReadOnly(True)
@@ -123,7 +121,7 @@ class MetadataDialog(QDialog):
         for widget in (
             self._title, self._author, self._charter, self._album, self._year,
             self._bpm, self._timesig,
-            self._track1, self._track2, self._track3, self._track4,
+            *self._track_edits.values(),
             self._duration, self._modified, self._comment,
         ):
             widget.setStyleSheet(_FIELD_STYLE)
@@ -143,10 +141,10 @@ class MetadataDialog(QDialog):
         form.addRow(_label("Beats per minute:"), self._bpm)
         form.addRow(_label("Time signature:"),   self._timesig)
         form.addRow(_sep())
-        form.addRow(_label("Track 1:"),          self._track1)
-        form.addRow(_label("Track 2:"),          self._track2)
-        form.addRow(_label("Track 3:"),          self._track3)
-        form.addRow(_label("Track 4:"),          self._track4)
+        if self._track_edits:
+            form.addRow(_label("Track labels (shown in the track selector):"))
+            for i, (_name, edit) in enumerate(self._track_edits.items(), 1):
+                form.addRow(_label(f"Track {i}:"), edit)
         form.addRow(_sep())
         form.addRow(_label("Duration:"),         self._duration)
         form.addRow(_label("Last modified:"),    self._modified)
@@ -184,12 +182,12 @@ class MetadataDialog(QDialog):
             'year':     self._year.text().strip(),
             'bpm':      self._bpm.text().strip(),
             'timesig':  self._timesig.currentText().strip(),
-            'track1':   self._track1.text().strip(),
-            'track2':   self._track2.text().strip(),
-            'track3':   self._track3.text().strip(),
-            'track4':   self._track4.text().strip(),
             'duration': self._duration.text().strip(),
             'modified': self._modified.text().strip(),
             'comment':  self._comment.toPlainText().strip(),
         })
         return out
+
+    def get_track_labels(self) -> dict[str, str]:
+        """Per-slot display labels edited in this dialog (name -> label)."""
+        return {name: edit.text().strip() for name, edit in self._track_edits.items()}
