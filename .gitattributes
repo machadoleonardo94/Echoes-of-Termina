@@ -1,2 +1,9 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Auto detect text files and perform LF normalization.
+#
+# eol=lf pins the checkout side as well: text files are written with LF into
+# the working tree on every platform, regardless of a local core.autocrlf=true
+# (common default on Git for Windows). Blobs were already stored as LF and no
+# CRLF blobs exist in history, so this only settles what lands on disk — it
+# stops the "LF will be replaced by CRLF the next time Git touches it" churn
+# and keeps working copies identical between Windows, macOS and Linux.
+* text=auto eol=lf
