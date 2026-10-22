@@ -582,5 +582,349 @@ its own confirmation.
 ~31 KB free, which is why the list is built once at play time and never rebuilt on a
 skip.
 
+---
+
+## 13. Status lights — the strip as a state display
+
+Section 11 makes the board *say* what changed. A cue is an **edge**: it fires at the
+transition and then there is nothing. The question a user asks from across a room, in
+silence, of a mask hanging on a wall, is the **level**: what is this doing *now*?
+
+There is one case where the cue set cannot answer it at all. `CUE_WIFI_FAIL` fires from
+`setup_WIFI()` on portal timeout and from `wifi_enable()` when the 4 s hold cannot
+reconnect. A connection that drops *hours after* a successful join is announced
+nowhere: the portal is unreachable, the phone is not streaming, the strip is idle — and
+the board is indistinguishable from a healthy one until somebody tries the portal and
+finds it gone. That, more than convenience, is what justifies this section.
+
+Four rules govern it:
+
+1. **It never fights the show.** The status layer is a renderer like the others and
+   stands down exactly as `run_lightshow()` and `run_led_animation()` already do
+   (`ui_feedback_active()`).
+2. **It never fights the owner.** Two settings, below.
+3. **It is readable by pattern, not only by hue** — see the colour-blindness note.
+4. **It costs little.** A few pixels at a cap well under the show ceiling
+   (`led_config.h`), because a held indicator is a permanent load.
+
+### 13.1 Which radio, and what state
+
+The modes are exclusive: `setup_bluetooth_mode()` calls `WiFi.mode(WIFI_OFF)`, so hue
+alone cannot carry both *which radio* and *how it stands*. **Hue carries the radio,
+pattern carries the state.**
+
+| state | class | hue | pattern | where the state comes from |
+| --- | --- | --- | --- | --- |
+| Bluetooth paired | idle | blue | steady, very dim | `a2dp_sink.is_connected()` |
+| Bluetooth awaiting a source | idle | cyan | two short breaths | boot, and after a disconnect |
+| Wi-Fi connected | idle | green | steady, very dim | `WiFi.status() == WL_CONNECTED` |
+| Wi-Fi lost after a join | idle | green | one long breath | Wi-Fi mode with `status() != WL_CONNECTED` |
+| config portal open | transient | white-amber | double-blink | WiFiManager `setAPCallback()`, ≤60 s |
+| file transfer running | activity | yellow | chase, **one step per chunk written** | `POST /api/upload` handler |
+| drop-in update | activity | purple | **static** | `updatefromSD()` |
+| OTA update | activity | purple | ramp | `ArduinoOTA.onProgress` |
+| SD card unreadable | fault | red | fast double-blink | SD mount failure |
+| battery low | action | red | three blinks, then unlatch | ADC < 3.1 V and not charging |
+
+Three consequences worth stating:
+
+* **"Wi-Fi lost" is green, and that is deliberate.** Red is reserved for faults — the
+  card and the battery — because a mask whose network went away still plays everything
+  on its card. Losing Wi-Fi is a *degraded connection*, not a failure, and painting it
+  red would teach the user to ignore red.
+* **The fresh-board ambiguity is solved by family, not by brightness.** A board that
+  never connected shows green-breathing (Wi-Fi mode) or cyan-breathing (fallback to
+  Bluetooth); the two breaths differ in length *and* the hues differ, which survives
+  red-green colour blindness where a red/amber pair would not.
+* **Red and amber are now free of the transfer colour.** Yellow is an activity hue and
+  never appears beside a warm idle hue, in the same way purple never does.
+
+**Which pixels carry it.** The board knows which shape it is wearing from its own LED
+count (`/api/leds` `count`, 1–200): a mask is the 28-zone default, and a plain strip is
+almost never exactly 28 pixels.
+
+| board | pixels lit for a status colour |
+| --- | --- |
+| mask (`count == 28`) | the ten onboard spikes only |
+| strip (anything else) | the whole chain, at the status brightness cap |
+
+Two assumptions worth confirming on the board rather than trusting: that the ten onboard
+pixels are the first ten of the chain (so a status colour cannot land on a detached
+breakout strip), and that no real strip is 28 pixels long. The second is a known
+collision, accepted — a 28-pixel strip would be treated as a mask and light only its
+first ten pixels.
+
+**Two chains are easier to count than one.** The mask chain stays where it already is,
+`LED_output` (GPIO23); the second strip hangs off GPIO33. A board with that second output
+declares its shape in hardware, so nothing has to be inferred from a number:
+
+| board | what `count` means | how "is this a mask?" is answered |
+| --- | --- | --- |
+| two outputs (GPIO23 + GPIO33) | the **additional** strip's length; the mask chain is fixed at its own 28 | by the hardware, not by the number |
+| one output (GPIO23 only) | the total chain length | `count == 28` → mask, anything else → strip |
+
+That also decides the status colour: on a two-output board the spikes are always the mask
+chain, whatever `count` says. The I2S pins are untouched by any of it — GPIO27 stays the
+amplifier's bit clock. The only untested part is the second output itself.
+
+### 13.2 Two layers, two lifetimes
+
+An idle indicator holds for hours; an activity indicator holds for as long as the
+operation. They are not the same kind of thing and must not share a timeout.
+
+**Priority, highest first:**
+
+```
+drop-in / OTA update
+> file transfer
+> low-battery alert
+> gesture acknowledgement (existing ui_feedback overlay)
+> SD fault
+> show (lightshow or animation)
+> status colour
+> idle decoration
+```
+
+The status colour draws only when nothing above it wants the strip, which is why "idle"
+is in its name: a running show owns the pixels, and a status light that interrupted a
+show would be the loudest possible version of the wrong idea. The one exception is
+deliberate and opt-in: `anim=3` (13.4) spends the animation slot itself on the status
+colour.
+
+**Idle decoration** starts after roughly 60 s in which nothing user-visible happened —
+no button gesture, no transport change, no HTTP request, no audio. It is the answer to
+a mask being used as a decoration: dim, moving, or dark, chosen by the owner. **The
+default is dark** — the feature ships silent, and a pulse or an animation is something
+the owner switches on. Once on, it runs until the low-battery cutoff; nothing else stops
+it. At roughly 5 % white a 28-pixel mask draws on the order of 80 mA, so "animated"
+costs about a day on a 2000 mAh cell — the practical bound on the feature, not a bug.
+
+### 13.3 The radio while idle
+
+Two tiers, because a connected radio and a dark one cost different amounts and the same
+mask needs both behaviours at different moments:
+
+| tier | when | radio | portal reachable |
+| --- | --- | --- | --- |
+| 1 | the first ~10 min of idle | associated, **modem sleep on** (`WiFi.setSleep(true)`) | yes |
+| 2 | after that | `WIFI_OFF`, the same call the show teardown uses | **no** |
+
+Tier 1 exists because tier 2 makes the board undiscoverable: with the radio off, mDNS
+goes with it, the HTTP server cannot be reached, and the editor's discovery cannot find
+`echoes.local`. Ten minutes is far longer than the 60 s HTTP-activity timer, so anyone
+actually using the portal never falls through to tier 2, and anyone who walked away does.
+
+This changes one line at the source. `get_saved_wifi()` currently forces
+`WiFi.setSleep(false)`, so the radio draws at full RX whenever the board is up; modem
+sleep is the fix and costs nothing in reachability. Playback is unaffected either way —
+a track tears the radio down completely (`wifi_disable_for_show()`), which is the same
+`WIFI_OFF` state as tier 2.
+
+**One wake path serves both tiers.** Any press, or any of the intent events, returns the
+board to tier 1 and — if it had fallen to tier 2 — runs the bounded reconnect in 13.5. A
+failed reconnect reports offline and leaves the board in tier 1, so the next wake tries
+again instead of parking the user with a portal that looks dead.
+
+**The 4 s hold is the manual recovery, and that is what makes tier 2 safe.** The EXT
+very-long hold calls `ctrl_wifi_restore()` → `wifi_enable()`, which releases the decoder's
+buffers, re-inits the driver (`WIFI_OFF` → `WIFI_STA` → `WiFi.begin()`), restarts the
+portal if it was down, re-arms OTA and cues `CUE_WIFI_OK` / `CUE_WIFI_FAIL` on the result.
+So a board can be genuinely network-independent — `retry_on_wake=no`, radio off in tier 2 —
+and still not be unreachable to someone who wants the portal: press to wake, hold to
+restore. One code consequence: `wifi_enable()` currently sets `WiFi.setSleep(false)`,
+which under this policy undoes tier 1 — it should leave modem sleep on.
+
+Scope: Wi-Fi mode only. Bluetooth mode has its radio off already, and the tiers are
+meaningless there.
+
+### 13.4 Settings
+
+Two LED selectors under `POST /api/leds`, beside the existing `LED_count` and `anim`:
+
+| setting | values | meaning |
+| --- | --- | --- |
+| `status` | `off` / `change` / `always` | lights off; a brief indication on each state change; held while the state lasts |
+| `idle` | `dark` / `dim` / `animated` | what an idle board does after the timeout (default `dark`) |
+
+And one connectivity preference, which belongs with the credentials in the `"wifi"`
+namespace rather than with the LED settings:
+
+| setting | values | meaning |
+| --- | --- | --- |
+| `retry_on_wake` | `yes` / `no` | whether waking a board that is in Wi-Fi mode but offline re-tries the saved network (13.5) |
+
+The settings are preferences and persist: `status` and `idle` in the same `"leds"`
+namespace that already holds `LED_count` and `anim`, `retry_on_wake` in `"wifi"` beside
+the credentials. The **states** are not stored at all. The board
+re-derives everything at boot and re-measures the battery rather than remembering it, so
+a persisted "was offline" or "was idling" would only be a stale copy of something already
+known — and one that could disagree with reality after the battery is swapped.
+
+**One rename and one new mode, recorded so the code can follow the doc.**
+
+* `count` becomes **`LED_count`**: same value, unambiguous name. The NVS key moves with
+  it, and there is deliberately no legacy fallback — nothing is in production, the testers
+  expect breakage, and a renamed key that a board forgets exactly once (back to 28 pixels
+  and the 28-pixel ceiling) is the cheapest migration available. The portal takes the new
+  argument name; there is no reason to carry the old one.
+* `anim` keeps its name and gains a fourth value, **`3` = status echo**:
+
+  | value | mode | what the strip does for a track with no `.echoes` show |
+  | --- | --- | --- |
+  | 0 | none | stays dark (the default) |
+  | 1 | envelope | amplitude bar, mirrored from the centre |
+  | 2 | FFT | frequency spectrum, low end in the middle |
+  | 3 | status echo | draws the state colour |
+
+  It costs nothing on the audio path — no PCM-tap processing, none of the FFT's ~5.2 KB
+  — because it renders the same code the status layer already uses. It does not overlap
+  the idle layer either: the animation slot only runs during playback, and the status
+  colour only runs when nothing above it wants the strip.
+
+### 13.5 Waking a board that is idling
+
+A hung mask will be brushed against, and a touch module gives no tactile feedback to
+tell a real press from a sleeve. The module drives the existing `button` input (GPIO19 on
+Marajoara V3), so it presents itself to the firmware as an ordinary active-high press and
+nothing in `buttons.h` or `controls.h` changes. So:
+
+* **The first press is absorbed.** While idle decoration runs, any press cancels it and
+  is consumed; the gesture the user then makes behaves normally. This is what keeps a
+  brush from pausing music or switching modes, and it makes the destructive gestures
+  (mode switch, reboot, standalone show) require a second, deliberate interaction.
+* **The acknowledgement is three bright blinks of the current state colour** —
+  `ui_flash(3, color)`, which already fits `UI_FLASH_TOTAL_MS` (700 ms, 233 ms a blink)
+  and caps at four. Bright flashes for a transient, dim steady/breathing for a held
+  state: the same hue at two brightnesses is not ambiguous.
+* **Events that already imply intent do not need the gate.** A Bluetooth connection, an
+  HTTP request, or playback starting cancels the decoration without consuming anything.
+* **A wake can re-check the network.** If the board is in Wi-Fi mode and currently
+  offline, the wake runs a bounded attempt against the saved credentials — five seconds,
+  no captive portal, no AP — and reports the result. Some owners deliberately run this
+  board with no network at all while still wanting the standalone show the touch button
+  starts, which is why this is the `retry_on_wake` setting rather than fixed behaviour.
+  A failure is announced on the edge as well as held as a colour: the cue fires when the
+  speaker is free, and the light always.
+* **Cost, stated honestly:** skipping a track from idle becomes press-then-double-click.
+
+### 13.6 Low battery
+
+`ADC < 3.1 V` and not charging — where "not charging" is now unambiguous, because
+CHRG/STDBY both read HIGH only when the module has no VBUS. Three dim red blinks, then
+the latch is released.
+
+* **Checked early on boot**, before `setup_WIFI()` is allowed to bring the radio up, and
+  again every 60 s.
+* **Sag is the signal, not the noise.** While charging the battery sources nothing, so
+  it cannot sag; while discharging, a 3.1 V reading during a Wi-Fi burst or a
+  MAX98357A peak is the warning itself. Triggering protection on it is the point —
+  waiting for a resting voltage lets the cell go deeper for no benefit.
+* **The blinks are deliberately dim.** They land at the moment the rail is weakest, and
+  a full-brightness ring there is the one thing that could brown the board out
+  mid-signal.
+* **No NVS latch.** After a shutdown the board re-measures on the next boot and shuts
+  down again if it is still low: the indication repeats, which is the desired
+  behaviour, and nothing has to be cleared by hand.
+
+**Charge sensing on Marajoara V3.** The TP4056's `CHRG#`/`STDBY#` are wired to the charge
+LEDs and nothing else — the V3 board file carries no net on either pad beyond the package's
+own pin names — so there is no MCU path today and this revision has to add one.
+
+**No single status pin can carry the answer.** With VBUS absent the TP4056 is unpowered, and
+its output pins are dragged near ground by the pull-up leaking through the pin's ESD diode —
+so both `CHRG#` and `STDBY#` read LOW, which is also what "terminated" reads on one pin
+alone. Two pins plus the ADC resolve it completely:
+
+| `CHRG#` | `STDBY#` | V_REG | state |
+| --- | --- | --- | --- |
+| LOW | HIGH | climbing | charging |
+| HIGH | LOW | ≥ ~4.1 V and steady | charge complete |
+| LOW | LOW | falling, sagging under load | unpowered — discharging |
+| LOW | LOW | ~4.05 → 4.2 V, brief | the recharge transition, not a fault |
+
+Both-low is the "the charger is not talking" signature; V_REG and the history separate an
+unplugged cell from the recharge transition. Steady both-low with a *falling* cell is the
+unplugged case, and the only one where the mask has to think about battery life.
+
+**VBUS is not measured, and it would buy nothing.** With Q3/Q4 holding the battery off the
+load whenever VBUS is present, the cell cannot discharge during a charge, and a charger too
+weak for the load browns the rail out rather than draining the cell — a failure the BMS
+handles bluntly on its own. Either VBUS is there or it is not; what the ADC contributes is
+the cell's voltage, not the rail's.
+
+**Pins: `CHRG#` on GPIO4, `STDBY#` on GPIO35, second strip output on GPIO33.** GPIO4 brings
+its own pull-up; GPIO35 is input-only with none, so an external one is required — and the
+board already carries 100 k, so two in parallel (~50 k) is the value to use rather than
+introducing a 47 k. Keeping it weak is better electrically too: ~50 k drives only tens of µA
+into the unpowered part's ESD diode, holding the node at a comfortable logic low instead of
+pushing it into the ambiguous band that a stiff pull-up would. That leaves **GPIO39** as the
+only spare pin on the board, which is why it is pencilled in for a second touch input.
+
+GPIO33 becoming the second strip output means the ten-spike rule in 13.1 now needs a story
+for two chains — carried to 13.8.
+
+Reading `STDBY#` rather than `CHRG#` is the cleaner half of the pair: "charge complete" is
+asserted directly instead of inferred from the cell having reached 4.1 V. Rapid `STDBY#`
+cycling is the fault case — a healthy full cell re-enters the 4.05 V recharge threshold
+every few hours at most, so flipping every few seconds means the cell cannot hold its
+voltage. That is also what V1 looks like from outside, because its board load steals charge
+current and the TP4056 never reaches termination; V3's VBUS-supplied topology is the fix.
+
+**No board needs the rule gated off.** A cell being charged is being pushed up, not
+drained, so the ADC cannot read below 3.1 V while a charger is attached; a board that reads
+low is genuinely low, and the correct answer is to blink, unlatch and let it charge rather
+than let the user force another session out of a flat cell. The BMS will cut the drain far
+less politely, and browning out under the amplifier is worse than a mask that declines to
+start. `PINOUT_HAS_CHARGE_SENSE` therefore buys an accurate state for the log, not safety.
+
+### 13.7 Where each piece goes
+
+| piece | file |
+| --- | --- |
+| the renderer, joining the `ui_feedback_active()` stand-down gate | `services/ui_feedback.h` |
+| a `status_state()` poll (1 Hz is enough) feeding it | `services/mode_manager.h` / `loop()` |
+| transfer step, one per chunk | `_portal_upload_handler` in `services/wifi_portal.h` |
+| update colour | `components/SDCARD/setup.h`, `features/update_firmware_ota.h` |
+| battery threshold and unlatch | `main.cpp` (boot check before mode setup) + `read_adc()` |
+| the LED settings | `_portal_leds` in `services/wifi_portal.h` |
+| the wake reconnect (`retry_on_wake`) | `services/wifi_settings.h`, polled from `loop()` |
+
+**The one real hazard:** during a drop-in update the flash cache is disabled while
+`Update.writeStream()` erases and writes, so code in flash and DMA-driven peripherals
+must not be touched. Render purple **once, before `Update.begin()`**, then stay silent
+through the write — the reboot or the failure path is what follows. The OTA path is the
+opposite: `ArduinoOTA.onProgress` runs in `loop()` in normal context, so a real ramp is
+safe there, which is why the two purple behaviours differ.
+
+Two notes on the wake reconnect. It must be a **polled state machine with a five-second
+deadline, never a `while` loop** — the wake press usually also starts playback, and five
+blocking seconds would stall the audio pump and the lightshow behind it. And the
+"offline" cue can only be played when the decoder does not own `I2S_NUM_0` (section 11:
+`cue_play_now()` installs the peripheral per cue in Wi-Fi mode), so a wake that goes
+straight into a track reports by light alone. A successful reconnect re-binds the OTA
+socket (`setup_OTA()` is idempotent and re-arms port 3232 on the new netif); the portal
+itself never stopped listening.
+
+### 13.8 Open
+
+Settled while writing this section: a dropped connection announces itself on the edge
+(cue) and holds as a light (green breath), and it does not re-announce on its own — the
+wake path is what re-checks it; states are never stored, settings are; a mask lights its
+ten spikes and a strip lights the whole chain; the idle default is `dark`; the radio
+sleeps through two tiers; and nothing stops the decoration except the low-battery cutoff.
+
+Still open:
+
+1. **Idle animations** — a soft pulse, a clock, rainbow fluid. Not today: the default is
+   no animation, and `idle=animated` therefore has no animation assigned to it yet. Worth
+   noting before one is chosen that a *clock* needs network time, so it can only ever
+   work in Wi-Fi mode connected.
+2. **Which chain indices are the ten spikes.** The renderer should index 0–9 only once
+   that is confirmed on Marajoara V3.
+3. **The second strip output itself.** The pins are settled — mask chain on `LED_output`
+   (GPIO23), second chain on GPIO33, amplifier bit clock untouched on GPIO27 — and so is
+   the counting rule in 13.1. What remains is that the second output has never been driven:
+   no cable, no strip, no measured frame rate with two chains refreshing.
+
 
 
