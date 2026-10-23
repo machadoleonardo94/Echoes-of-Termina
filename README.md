@@ -10,8 +10,8 @@ desktop tool that authors the lightshows it plays.
 |---|---|
 | **Hardware** | ESP32-WROOM-32 board, 2x MAX98357A I2S amplifiers, WS2812B output, microSD, TP4056 charger, 2 buttons |
 | **Firmware** | Bluetooth A2DP sink, local SD playback, `.echoes` lightshow decoder, Wi-Fi control panel |
-| **Desktop** | Python/PySide6 editor: drop in an MP3, draw the LED animation, upload the project to the board |
-| **Status** | v0.8.0 pre-release — bench bring-up done, mask content and full board validation pending |
+| **Desktop** | Python/PySide6 editor: drop in an MP3, design the LED animation, upload the project to the board |
+| **Status** | v0.8.0 pre-release — bench bring-up done, mask full board validation pending |
 
 The project is three separable pieces that meet at the microSD card and the
 `.echoes` script format: `Hardware/` (KiCad boards), `Firmware/` (PlatformIO /
@@ -34,7 +34,7 @@ microSD socket, a charging IC, a handful of passives and the LED chain.
 | Storage | microSD over 1-bit SDMMC | CLK / CMD / D0; hinged socket on the mask boards, spring-loaded tray on Echoes V2 |
 | LED output | 5 V WS2812B data line (`Strip_out`) | 1 to 200 pixels, brightness ceiling scaled to the count |
 | Charging | TP4056 + USB-C | charge status LEDs |
-| Power | AP2112K-3.3, PMOS latch on `latch_enable` | 2x 220 uF polymer + 100 nF decoupling, 220 mR sense resistor |
+| Power | AP2112K-3.3, PMOS latch on `latch_enable` | 2x 220 uF polymer + 100 nF decoupling |
 | Buttons | PROG (GPIO0, active low) + external (active high) | polled, debounced gesture layer |
 
 ### Boards
@@ -122,11 +122,73 @@ without a phone or a network.
 
 ### Two-button interface
 
-`PROG` and the external button feed a polling state machine that emits clicks,
-doubles, triples, holds and very-long holds. `services/controls.h` is the only place
-that decides what a gesture means; feedback goes back through two channels — tones
-mixed into the audio and an overlay on the LED strip. The full evaluation, including
-measured press timings and the state diagrams, is in
+Two buttons, one gesture engine. `services/buttons.h` turns pin levels into
+debounced gestures and knows nothing else; `services/controls.h` decides what each
+gesture does — it is the only place the interface is defined, so the map below can be
+argued about (and changed) without touching the state machine.
+
+| Button | Pin | Idle level | Note |
+|---|---|---|---|
+| `PROG` | GPIO0 | high, press shorts to GND | onboard boot button, single-purpose |
+| `EXT` | GPIO4 | low, press feeds 3V3 | external button; a touch module on Marajoara V3 presents the same active-high press |
+
+#### Gesture map
+
+| Gesture | When it fires | `PROG` (GPIO0) | `EXT` (GPIO4) |
+|---|---|---|---|
+| **click** | released before 600 ms — and, on `EXT`, no further press within 400 ms | play / pause — with nothing loaded in Wi-Fi mode, starts a standalone show | next song — with nothing loaded in Wi-Fi mode, starts a standalone show |
+| **double** | two presses in one burst | — | cycle the LED animation: none → envelope → FFT |
+| **triple** | three presses in one burst | — | switch mode (reboots the board) |
+| **hold / repeat** | still down at 600 ms, then one repeat every 150 ms | volume down, 5 % per tick | volume up, 5 % per tick |
+| **very long** | still down at 4000 ms | restart the current song | bring Wi-Fi back after a standalone show tore it down |
+
+The two buttons are deliberately asymmetric. `PROG` is single-purpose, so its clicks
+are committed **the instant the button comes up** — no 400 ms wait. `EXT` carries the
+full multi-click ladder, and only its clicks pay that window, because at the moment of
+release a second tap may still be coming. The window is a per-button property
+(`multi_gap_ms`), not a global constant.
+
+#### How a press is classified
+
+Every press must survive a 25 ms debounce before the ladder even sees it. Then,
+per button:
+
+| Tier | Fires when | Result |
+|---|---|---|
+| `MIN_PRESS` | the press ends within 50 ms of starting | discarded as an electrical blip; an open click burst is left untouched |
+| `CLICK` | released before 600 ms | `BTN_EV_CLICK` — `PROG` commits it on release; `EXT` waits 400 ms with no further press first |
+| `DOUBLE` | two presses in one burst (`EXT` only) | `BTN_EV_DOUBLE` |
+| `TRIPLE` | three presses in one burst (`EXT` only) | `BTN_EV_TRIPLE` — a fourth press stays a triple |
+| `HOLD` | still down at 600 ms | `BTN_EV_HOLD`, then `BTN_EV_REPEAT` every 150 ms, then `BTN_EV_RELEASE` on let-go |
+| `VERY_LONG` | still down at 4000 ms | `BTN_EV_VERY_LONG` once — it stops the repeat train |
+
+A hold swallows the burst it interrupted: press-press-hold is a `HOLD`, never a
+`DOUBLE` followed by a hold. A very-long hold also undoes the volume ramp its own
+first four seconds performed, so "restart this song" never leaves the volume yanked to
+one end.
+
+#### Feedback
+
+Each action answers back, because the two backends look identical from the outside:
+
+- **Tones** — `audio_cues.h` mixes short cues into the audio (play, pause, next,
+  confirm, deny, mode-switch arpeggio, and a rising/falling volume tick whose pitch
+  reports the level; cues mix after volume control so they stay audible at any
+  setting).
+- **Strip overlay** — `ui_feedback.h` draws a volume bar while a ramp runs; the
+  animation cycle blinks 1 / 2 / 3 times in blue to say *which* animation was landed
+  on (the audio-reactive modes otherwise look identical while silent); a triple-click
+  gets three blocking white flashes before the reboot; the very-long Wi-Fi restore
+  gets two green flashes.
+- **Serial log** — every gesture prints `[BTN] PROG/EXT <event> (<held> ms)`.
+
+The diagnostic build (`echoes-v1-btn`, `-DBUTTON_TRACE=1`) logs every raw edge and a
+5-second idle-level census for both pins, so a dead wire or stuck button is visible
+immediately — and it refuses the destructive gestures (mode switch, standalone show)
+so a misread cannot cost the verification session.
+
+The full evaluation, including measured press timings, the state diagrams and the
+design decisions behind the map, is in
 [`Firmware/echoes_of_termina/docs/two-button-ui.md`](Firmware/echoes_of_termina/docs/two-button-ui.md).
 
 ### Portal API
@@ -148,9 +210,12 @@ measured press timings and the state diagrams, is in
   claim RAM. How the image reached the card does not matter and the firmware cannot tell:
   `POST /api/stage-firmware` from a browser and a card moved to a PC reader both leave the same
   file in the same place.
-- **USB:** charging and first flash only — the bootloader and partition table come from a
-  PlatformIO session. There is no data path over the connector, by design; see the storage
-  limitation below.
+- **Serial (first flash, from a USB-to-serial adapter on `PORT1`):** the bootloader and
+  partition table — and the base image on a blank board — come from a PlatformIO session
+  over the UART0 console on GPIO1/GPIO3. There is no data path over the USB-C connector,
+  and no bridge to the card, by design; see the storage limitation below.
+- **USB-C:** charging only. The connector carries power and nothing else, so once the
+  board has a runnable image there is no reason to reach for a cable.
 
 ### Build
 
@@ -164,7 +229,7 @@ pio run -e echoes-v1 -t upload     # flash the bench board over OTA
 | Environment | Board | Notes |
 |---|---|---|
 | `echoes-v1` | Echoes V1 | PSRAM disabled, 8 MB partitions |
-| `esp32-N16` | Echoes V1 pinout | 16 MB flash, no PSRAM |
+| `esp32-N16` | Echoes V1 | 16 MB flash, no PSRAM |
 | `marajoara-v3` | Marajoara V3 | PSRAM enabled |
 | `echoes-v1-btn` | diagnostic | logs every button edge, refuses destructive gestures |
 | `marajoara-v3-bench` | diagnostic | one-shot microSD throughput benchmark |
@@ -201,16 +266,6 @@ the firmware (which skips `[...]` lines entirely):
 0:04.032  FADE 32 96 224 99  9-12
 ```
 
-The importer composes the label as `zone (instrument)` — "Column + Eyes" + MIDI track
-`PART DRUMS` → `Column + Eyes (Drums)` (the `PART ` prefix is dropped and shouting
-names are title-cased; a bare `.chart` section such as `ExpertSingle` contributes no
-instrument) — and writes `# Mask sector:` / `# Instrument:` comments into the body so
-the saved project documents where the track came from. The track selector shows the
-label alone (falling back to the stored section name for unlabelled tracks), and
-Script Properties labels its rows *Track 1..N* and lets you edit each label, whose
-field shows the full `zone (instrument)` text. Merged mask exports carry no headers,
-so labels never reach the board.
-
 ---
 
 ## Desktop editor
@@ -242,6 +297,20 @@ Requirements: Python 3.10+ with PySide6 (installed automatically on first run) a
 `Run Echoes.bat`.
 
 ![Standalone FFT spectrum analyser](Media/spectrum-analyser.jpg)
+
+An importer is included for translating .chart and .midi files used in Clone Hero projects.
+The importer composes the label as `zone (instrument)` — "Column + Eyes" + MIDI track
+`PART DRUMS` → `Column + Eyes (Drums)` (the `PART ` prefix is dropped and shouting
+names are title-cased; a bare `.chart` section such as `ExpertSingle` contributes no
+instrument) — and writes `# Mask sector:` / `# Instrument:` comments into the body so
+the saved project documents where the track came from. The track selector shows the
+label alone (falling back to the stored section name for unlabelled tracks), and
+Script Properties labels its rows *Track 1..N* and lets you edit each label, whose
+field shows the full `zone (instrument)` text. Merged mask exports carry no headers,
+so labels never reach the board.
+
+![Importer — Template](Media/Importer-from-Clone-Hero.jpg)
+
 
 ---
 
@@ -327,19 +396,21 @@ build also reads the whole script into RAM rather than streaming it, supports `S
   the ESP32 N8R2, and an S3 is judged against Marajoara V3's measurements rather than instead
   of them.
 - **There is no on-board data path to the card, deliberately.** File management is the Wi-Fi
-  portal or pulling the card and using a reader on the PC; USB on the board is a charging  port and nothing else. A bridge MCU between the host and the ESP32 was the
+  portal or pulling the card and using a reader on the PC; USB-C on the board is a charging
+  port and nothing else. A bridge MCU between the host and the ESP32 was the
   alternative and was rejected: it needs a second chip, a link and a protocol on both sides, and
   the card still ends up as the interface for anyone who will not use Wi-Fi — which makes the
   socket itself a product decision rather than a BOM line. The mask boards keep the hinged
   socket, which holds a seated card against a device that gets carried and hung; Echoes V2,
   which lives on a bench, takes a spring-loaded tray so the card can be swapped without
   fingernails.
-- **A USB bridge would not have been fast enough to justify itself.** USB Full-Speed is the
-  ceiling on this class of chip — the host sees 12 Mbit/s, so about 1 MB/s is the most a bridge
-  could carry, and 300 MB is a five-minute job at that rate in the best case. Reaching that
-  ceiling costs pins and a second protocol: 2 Mbaud UART is about 180 KB/s, 5 Mbaud roughly
-  doubles it, and a classic-ESP32 SPI slave is specified to 10 MHz and falls to 7.2 MHz through
-  the GPIO matrix — while the C3 that would be the faster slave cannot initiate a transfer. The
-  Wi-Fi portal already built is RAM-limited rather than bandwidth-limited and lands in the same
-  range, and a USB card reader moves 300 MB in seconds. The bridge would have bought a
-  cable for one kind of user at a speed none of them would have accepted.
+- **A USB bridge was dropped on cost, not on speed.** The speed was never the binding
+  constraint: a project is 2–5 MB — one song plus its lightshow — and uploads happen one
+  project at a time. USB Full-Speed tops out at 12 Mbit/s (about 1 MB/s), and a plain
+  USB-serial bridge at 2 Mbaud carries roughly 180 KB/s, which still moves a 5 MB project
+  in well under a minute; a cheap CH340G-class chip would do the job. What ruled it out
+  was the price of the convenience: a second chip, a link and a protocol on both sides,
+  for file movement the Wi-Fi portal already covers — while bulk library management is
+  what an SD card reader is for, at several hundred times the throughput. So the budget
+  went elsewhere: one project at a time drops over the Wi-Fi portal, and the library is a
+  card reader's job.

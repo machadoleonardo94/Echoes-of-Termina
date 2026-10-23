@@ -9,18 +9,21 @@
 //*!  interface can be argued about (and changed) without touching the state
 //*!  machine.
 //*!
-//*!  ── Provisional mapping ───────────────────────────────────────────────────
-//*!  This is the shape the firmware ships with while the two-button interface
-//*!  is being evaluated. It keeps every behaviour the single-button firmware
-//*!  had, adds the new external button, and puts the two rare/destructive
-//*!  actions on the two hardest gestures.
+//*!  ── The map ────────────────────────────────────────────────────────────────
+//*!  The map that shipped after the two-button evaluation (docs/two-button-ui.md
+//*!  §9). PROG is single-purpose, so buttons.h emits every tap as its own CLICK
+//*!  and this file never sees a DOUBLE or TRIPLE from it; EXT carries the ladder
+//*!  and pays the 400 ms click window.
 //*!
 //*!    gesture            PROG (GPIO0)                  EXT (GPIO4)
-//*!    click              play / pause                  next song
-//*!    double             restart song                  cycle LED animation
-//*!    triple             switch mode (reboots)         standalone show
+//*!    click              play / pause                  play when idle, else next song
+//*!    double             — (no ladder)                 cycle LED animation
+//*!    triple             — (no ladder)                 switch mode (reboots)
 //*!    hold + repeat      volume down                   volume up
-//*!    very long (4 s)    reboot the board              bring WiFi back
+//*!    very long (4 s)    restart the current song      bring WiFi back
+//*!
+//*!  A click in WiFi mode with nothing loaded means "play": it starts a
+//*!  standalone show off the SD card (see ctrl_play_from_idle), on either button.
 //*!
 //*!  ── Why there is a mode branch in every action ───────────────────────────
 //*!  The device has two playback backends and they are not interchangeable:
